@@ -1,0 +1,58 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "openclaw-memory"
+version = "0.1.0"
+description = "Standalone Python implementation of the OpenClaw memory subsystem"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+dependencies = [
+    "typer>=0.12",
+    "rich>=13",
+]
+
+[project.optional-dependencies]
+openai = ["openai>=1.0"]
+gemini = ["google-generativeai>=0.8"]
+voyage = ["voyageai>=0.3"]
+local = ["llama-cpp-python>=0.2"]
+all = [
+    "openai>=1.0",
+    "google-generativeai>=0.8",
+    "voyageai>=0.3",
+]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=5",
+    "ruff>=0.4",
+    "mypy>=1.10",
+    "openai>=1.0",
+]
+
+[project.scripts]
+ocmem = "openclaw_memory.cli.main:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/openclaw_memory"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = ["-v", "--tb=short"]
