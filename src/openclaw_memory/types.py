@@ -1,9 +1,9 @@
 """Core types for the OpenClaw memory subsystem."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
-
 
 MemorySource = str  # "memory" | "sessions"
 
@@ -56,7 +56,7 @@ class MemoryEmbeddingProbeResult:
 
 @dataclass
 class MemoryFileEntry:
-    path: str       # workspace-relative
+    path: str  # workspace-relative
     abs_path: str
     mtime_ms: float
     size: int

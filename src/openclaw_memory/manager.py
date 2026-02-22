@@ -2,24 +2,23 @@
 MemoryIndexManager — core search, sync, and file read operations.
 Mirrors: src/memory/manager.ts
 """
+
 from __future__ import annotations
 
-import json
 import os
 import sqlite3
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from .config import ResolvedMemorySearchConfig, resolve_memory_search_config
 from .embeddings import EmbeddingProvider, create_embedding_provider
-from .hybrid import bm25_rank_to_score, build_fts_query, merge_hybrid_results
+from .hybrid import merge_hybrid_results
 from .internal import (
     is_memory_path,
     normalize_extra_memory_paths,
-    normalize_rel_path,
-    truncate_utf16_safe,
 )
 from .manager_search import search_keyword, search_vector
 from .query_expansion import extract_keywords
@@ -51,7 +50,9 @@ class MemoryIndexManager:
         # Resolve symlinks so path comparisons work consistently (e.g. macOS /tmp → /private/tmp)
         self.workspace_dir = os.path.realpath(workspace_dir)
         self.db_path = db_path
-        self._config = config or resolve_memory_search_config(workspace_dir=workspace_dir, overrides={"db_path": db_path})
+        self._config = config or resolve_memory_search_config(
+            workspace_dir=workspace_dir, overrides={"db_path": db_path}
+        )
         self._provider = provider
         self._provider_meta = provider_meta or {}
 
@@ -78,14 +79,20 @@ class MemoryIndexManager:
         self._closed = False
 
         # Determine provider model label
-        self._model = (
-            self._provider.model
-            if self._provider
-            else (self._config.model or "none")
-        )
-        self._provider_id = (
-            self._provider.id if self._provider else "none"
-        )
+        self._model = self._provider.model if self._provider else (self._config.model or "none")
+        self._provider_id = self._provider.id if self._provider else "none"
+        # Compute a provider key hash for cache isolation across different endpoints
+        self._provider_key = self._compute_provider_key()
+
+    def _compute_provider_key(self) -> str:
+        """Compute a hash of provider config for cache isolation."""
+        import hashlib
+
+        parts = [self._provider_id, self._model]
+        if self._config.remote and self._config.remote.base_url:
+            parts.append(self._config.remote.base_url)
+        raw = ":".join(parts)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
     # ------------------------------------------------------------------
     # Factory
@@ -97,16 +104,13 @@ class MemoryIndexManager:
         agent_id: str = "main",
         workspace_dir: str | None = None,
         *,
-        overrides: dict | None = None,
-    ) -> "MemoryIndexManager":
+        overrides: dict[str, Any] | None = None,
+    ) -> MemoryIndexManager:
         """
         Create a MemoryIndexManager with auto-selected embedding provider.
         """
         config = resolve_memory_search_config(
             agent_id, workspace_dir=workspace_dir, overrides=overrides
-        )
-        resolved_workspace = workspace_dir or config.store.path.replace(
-            f"/{agent_id}.sqlite", ""
         )
         # Re-resolve with proper workspace
         config = resolve_memory_search_config(
@@ -165,7 +169,7 @@ class MemoryIndexManager:
             keywords = extract_keywords(query)
             search_terms = keywords if keywords else [query]
 
-            seen: dict[str, dict] = {}
+            seen: dict[str, dict[str, Any]] = {}
             for term in search_terms:
                 kw_results = search_keyword(
                     self._db,
@@ -186,7 +190,7 @@ class MemoryIndexManager:
             return [self._to_search_result(r) for r in filtered]
 
         # Hybrid mode
-        keyword_results: list[dict] = []
+        keyword_results: list[dict[str, Any]] = []
         if hybrid_cfg.enabled and self._fts_available:
             keyword_results = search_keyword(
                 self._db,
@@ -205,7 +209,7 @@ class MemoryIndexManager:
             query_vec = []
 
         has_vector = any(v != 0 for v in query_vec)
-        vector_results: list[dict] = []
+        vector_results: list[dict[str, Any]] = []
         if has_vector:
             vector_results = search_vector(
                 self._db,
@@ -217,7 +221,9 @@ class MemoryIndexManager:
             )
 
         if not hybrid_cfg.enabled:
-            filtered = [r for r in vector_results if r["score"] >= actual_min_score][:actual_max_results]
+            filtered = [r for r in vector_results if r["score"] >= actual_min_score][
+                :actual_max_results
+            ]
             return [self._to_search_result(r) for r in filtered]
 
         merged_list = merge_hybrid_results(
@@ -225,15 +231,22 @@ class MemoryIndexManager:
             keyword=keyword_results,
             vector_weight=hybrid_cfg.vector_weight,
             text_weight=hybrid_cfg.text_weight,
-            mmr={"enabled": hybrid_cfg.mmr.enabled, "lambda_": hybrid_cfg.mmr.lambda_} if hybrid_cfg.mmr.enabled else None,
-            temporal_decay={"enabled": hybrid_cfg.temporal_decay.enabled, "half_life_days": hybrid_cfg.temporal_decay.half_life_days} if hybrid_cfg.temporal_decay.enabled else None,
+            mmr={"enabled": hybrid_cfg.mmr.enabled, "lambda_": hybrid_cfg.mmr.lambda_}
+            if hybrid_cfg.mmr.enabled
+            else None,
+            temporal_decay={
+                "enabled": hybrid_cfg.temporal_decay.enabled,
+                "half_life_days": hybrid_cfg.temporal_decay.half_life_days,
+            }
+            if hybrid_cfg.temporal_decay.enabled
+            else None,
             workspace_dir=self.workspace_dir,
         )
 
         filtered = [r for r in merged_list if r["score"] >= actual_min_score][:actual_max_results]
         return [self._to_search_result(r) for r in filtered]
 
-    def _to_search_result(self, r: dict) -> MemorySearchResult:
+    def _to_search_result(self, r: dict[str, Any]) -> MemorySearchResult:
         return MemorySearchResult(
             path=r["path"],
             start_line=r["start_line"],
@@ -275,11 +288,19 @@ class MemoryIndexManager:
         if not raw_path:
             raise ValueError("path required")
 
-        # Resolve to absolute
+        # Resolve to absolute WITHOUT following symlinks (use abspath, not realpath)
         if os.path.isabs(raw_path):
-            abs_path = os.path.realpath(raw_path)
+            abs_path = os.path.abspath(raw_path)
         else:
-            abs_path = os.path.realpath(os.path.join(self.workspace_dir, raw_path))
+            abs_path = os.path.abspath(os.path.join(self.workspace_dir, raw_path))
+
+        # Symlink guard BEFORE any further checks — detect symlinks on the
+        # un-resolved path so a symlink inside memory/ can't escape the workspace
+        if os.path.islink(abs_path) or not os.path.isfile(abs_path):
+            raise ValueError("path required")
+
+        if not abs_path.endswith(".md"):
+            raise ValueError("path required")
 
         # Compute relative path from workspace
         try:
@@ -308,13 +329,6 @@ class MemoryIndexManager:
         if not allowed:
             raise ValueError("path required")
 
-        if not abs_path.endswith(".md"):
-            raise ValueError("path required")
-
-        # Symlink guard
-        if os.path.islink(abs_path) or not os.path.isfile(abs_path):
-            raise ValueError("path required")
-
         content = Path(abs_path).read_text(encoding="utf-8")
 
         if from_line is None and lines is None:
@@ -323,7 +337,7 @@ class MemoryIndexManager:
         file_lines = content.split("\n")
         start = max(1, from_line or 1)
         count = max(1, lines if lines is not None else len(file_lines))
-        sliced = file_lines[start - 1: start - 1 + count]
+        sliced = file_lines[start - 1 : start - 1 + count]
         return {"text": "\n".join(sliced), "path": rel}
 
     # ------------------------------------------------------------------
@@ -358,6 +372,7 @@ class MemoryIndexManager:
                 model=self._model,
                 provider=self._provider,
                 provider_id=self._provider_id,
+                provider_key=self._provider_key,
                 fts_table=_FTS_TABLE,
                 fts_available=self._fts_available,
                 chunk_tokens=self._config.chunking.tokens,
@@ -370,9 +385,7 @@ class MemoryIndexManager:
 
     def _needs_full_reindex(self) -> bool:
         """Check whether the stored provider/model matches current config."""
-        row = self._db.execute(
-            "SELECT value FROM meta WHERE key = 'providerModel'"
-        ).fetchone()
+        row = self._db.execute("SELECT value FROM meta WHERE key = 'providerModel'").fetchone()
         stored = row[0] if row else None
         current = f"{self._provider_id}:{self._model}"
         if stored != current:
@@ -393,9 +406,10 @@ class MemoryIndexManager:
 
     def status(self) -> MemoryProviderStatus:
         """Return current index status. Mirrors: manager.ts::status"""
-        sf_sql, sf_params = ("", [])
+        sf_result: tuple[str, list[Any]] = ("", [])
         if sf_filter := self._build_source_filter():
-            sf_sql, sf_params = sf_filter
+            sf_result = sf_filter
+        sf_sql, sf_params = sf_result
 
         files_row = self._db.execute(
             f"SELECT COUNT(*) FROM files WHERE 1=1{sf_sql}", sf_params
@@ -410,9 +424,7 @@ class MemoryIndexManager:
         # Cache entries
         cache_entries: int | None = None
         if self._config.cache.enabled:
-            cr = self._db.execute(
-                f"SELECT COUNT(*) FROM {_EMBEDDING_CACHE_TABLE}"
-            ).fetchone()
+            cr = self._db.execute(f"SELECT COUNT(*) FROM {_EMBEDDING_CACHE_TABLE}").fetchone()
             cache_entries = cr[0] if cr else 0
 
         search_mode = "hybrid" if self._provider else "fts-only"
@@ -442,7 +454,9 @@ class MemoryIndexManager:
             fallback={
                 "from": self._provider_meta.get("fallback_from"),
                 "reason": self._provider_meta.get("fallback_reason"),
-            } if self._provider_meta.get("fallback_from") else None,
+            }
+            if self._provider_meta.get("fallback_from")
+            else None,
             custom={"search_mode": search_mode},
         )
 
@@ -452,7 +466,10 @@ class MemoryIndexManager:
 
     def probe_embedding_availability(self) -> MemoryEmbeddingProbeResult:
         if self._provider is None:
-            reason = self._provider_meta.get("unavailable_reason") or "No embedding provider (FTS-only mode)"
+            reason = (
+                self._provider_meta.get("unavailable_reason")
+                or "No embedding provider (FTS-only mode)"
+            )
             return MemoryEmbeddingProbeResult(ok=False, error=reason)
         try:
             self._provider.embed_query("ping")
@@ -473,7 +490,7 @@ class MemoryIndexManager:
         except Exception:
             pass
 
-    def __enter__(self) -> "MemoryIndexManager":
+    def __enter__(self) -> MemoryIndexManager:
         return self
 
     def __exit__(self, *_: Any) -> None:

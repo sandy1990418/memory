@@ -2,13 +2,16 @@
 Low-level SQLite search helpers for vector and keyword search.
 Mirrors: src/memory/manager-search.ts
 """
+
 from __future__ import annotations
 
-import json
+import re
 import sqlite3
 from typing import Any
 
 from .internal import cosine_similarity, parse_embedding, truncate_utf16_safe
+
+_SAFE_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 # ---------------------------------------------------------------------------
@@ -49,16 +52,21 @@ def search_vector(
         score = cosine_similarity(query_vec, emb)
         if score != score:  # NaN guard
             continue
-        scored.append((score, {
-            "id": chunk_id,
-            "path": path,
-            "start_line": start_line,
-            "end_line": end_line,
-            "score": score,
-            "snippet": truncate_utf16_safe(text, snippet_max_chars),
-            "source": source,
-            "vector_score": score,
-        }))
+        scored.append(
+            (
+                score,
+                {
+                    "id": chunk_id,
+                    "path": path,
+                    "start_line": start_line,
+                    "end_line": end_line,
+                    "score": score,
+                    "snippet": truncate_utf16_safe(text, snippet_max_chars),
+                    "source": source,
+                    "vector_score": score,
+                },
+            )
+        )
 
     scored.sort(key=lambda x: x[0], reverse=True)
     return [entry for _, entry in scored[:limit]]
@@ -85,15 +93,19 @@ def search_keyword(
     Full-text search using SQLite FTS5.
     Mirrors: manager-search.ts::searchKeyword
     """
+    if not _SAFE_IDENTIFIER.match(fts_table):
+        raise ValueError(f"Invalid table name: {fts_table!r}")
     if limit <= 0:
         return []
 
     # Import defaults lazily to avoid circular imports
     if build_fts_query_fn is None:
         from .hybrid import build_fts_query
+
         build_fts_query_fn = build_fts_query
     if bm25_rank_to_score_fn is None:
         from .hybrid import bm25_rank_to_score
+
         bm25_rank_to_score_fn = bm25_rank_to_score
 
     fts_query = build_fts_query_fn(query)
@@ -123,16 +135,18 @@ def search_keyword(
     for row in rows:
         chunk_id, path, source, start_line, end_line, text, rank = row
         text_score = bm25_rank_to_score_fn(rank)
-        results.append({
-            "id": chunk_id,
-            "path": path,
-            "start_line": start_line,
-            "end_line": end_line,
-            "score": text_score,
-            "text_score": text_score,
-            "snippet": truncate_utf16_safe(text, snippet_max_chars),
-            "source": source,
-        })
+        results.append(
+            {
+                "id": chunk_id,
+                "path": path,
+                "start_line": start_line,
+                "end_line": end_line,
+                "score": text_score,
+                "text_score": text_score,
+                "snippet": truncate_utf16_safe(text, snippet_max_chars),
+                "source": source,
+            }
+        )
 
     return results
 

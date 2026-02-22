@@ -2,11 +2,13 @@
 Maximal Marginal Relevance (MMR) re-ranking.
 Mirrors: src/memory/mmr.ts
 """
+
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TypeVar
+from typing import Any, TypeVar
 
 
 @dataclass
@@ -44,7 +46,13 @@ def compute_mmr_score(relevance: float, max_similarity: float, lambda_: float) -
 T = TypeVar("T")
 
 
-def mmr_rerank(items: list[T], *, score_fn, content_fn, config: MMRConfig | None = None) -> list[T]:
+def mmr_rerank(
+    items: list[T],
+    *,
+    score_fn: Callable[[T], float],
+    content_fn: Callable[[T], str],
+    config: MMRConfig | None = None,
+) -> list[T]:
     """
     Generic MMR re-ranking.
     score_fn(item) -> float
@@ -98,7 +106,9 @@ def mmr_rerank(items: list[T], *, score_fn, content_fn, config: MMRConfig | None
     return [items[i] for i in selected_indices]
 
 
-def apply_mmr_to_hybrid_results(results: list[dict], config: MMRConfig | None = None) -> list[dict]:
+def apply_mmr_to_hybrid_results(
+    results: list[dict[str, Any]], config: MMRConfig | None = None
+) -> list[dict[str, Any]]:
     """
     Apply MMR re-ranking to hybrid search result dicts.
     Each dict must have: score, snippet, path, start_line.

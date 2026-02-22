@@ -1,9 +1,10 @@
 """Config resolution for memory search (mirrors agents/memory-search.ts)."""
+
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-
+from typing import Any
 
 # ---------------------------------------------------------------------------
 # Sub-configs
@@ -190,7 +191,7 @@ def resolve_memory_search_config(
     agent_id: str = "main",
     workspace_dir: str | None = None,
     *,
-    overrides: dict | None = None,
+    overrides: dict[str, Any] | None = None,
 ) -> ResolvedMemorySearchConfig:
     """
     Resolve memory search config from environment variables and optional overrides dict.
@@ -213,13 +214,6 @@ def resolve_memory_search_config(
     provider = overrides.get("provider") or _resolve_provider()
     model = overrides.get("model") or _resolve_model(provider)
     fallback = overrides.get("fallback") or _resolve_fallback()
-
-    resolved_workspace = (
-        overrides.get("workspace_dir")
-        or workspace_dir
-        or os.environ.get("OPENCLAW_WORKSPACE")
-        or os.path.join(_resolve_state_dir(), "agents", agent_id, "workspace")
-    )
 
     db_path = overrides.get("db_path") or _resolve_db_path(agent_id)
 

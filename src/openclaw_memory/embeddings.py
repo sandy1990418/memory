@@ -2,14 +2,14 @@
 Embedding provider abstraction and adapters.
 Mirrors: src/memory/embeddings.ts, embeddings-openai.ts, embeddings-gemini.ts, embeddings-voyage.ts
 """
+
 from __future__ import annotations
 
 import math
 import os
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from .config import LocalConfig, RemoteConfig
-
 
 # ---------------------------------------------------------------------------
 # Protocol
@@ -53,7 +53,7 @@ class OpenAIEmbeddingProvider:
     def __init__(self, model: str, api_key: str, base_url: str | None, headers: dict[str, str]):
         import openai  # lazy import
 
-        client_kwargs: dict = {"api_key": api_key}
+        client_kwargs: dict[str, Any] = {"api_key": api_key}
         if base_url:
             client_kwargs["base_url"] = base_url
         if headers:
@@ -135,8 +135,7 @@ class LocalEmbeddingProvider:
             from llama_cpp import Llama  # lazy import  # noqa: F401
         except ImportError as exc:
             raise RuntimeError(
-                "Local embeddings require llama-cpp-python: "
-                "pip install 'openclaw-memory[local]'"
+                "Local embeddings require llama-cpp-python: pip install 'openclaw-memory[local]'"
             ) from exc
         from llama_cpp import Llama
 
@@ -156,7 +155,9 @@ class LocalEmbeddingProvider:
 # ---------------------------------------------------------------------------
 
 _REMOTE_PROVIDER_IDS = ("openai", "gemini", "voyage")
-DEFAULT_LOCAL_MODEL = "hf:ggml-org/embeddinggemma-300m-qat-q8_0-GGUF/embeddinggemma-300m-qat-Q8_0.gguf"
+DEFAULT_LOCAL_MODEL = (
+    "hf:ggml-org/embeddinggemma-300m-qat-q8_0-GGUF/embeddinggemma-300m-qat-Q8_0.gguf"
+)
 
 
 def _resolve_openai_key(remote: RemoteConfig | None) -> str | None:
@@ -221,13 +222,13 @@ def create_embedding_provider(
     fallback: str = "none",
     remote: RemoteConfig | None = None,
     local: LocalConfig | None = None,
-) -> tuple[EmbeddingProvider | None, dict]:
+) -> tuple[EmbeddingProvider | None, dict[str, Any]]:
     """
     Create an embedding provider following the same auto-selection logic as TS.
     Returns (provider_or_None, meta_dict).
     meta_dict keys: requested_provider, fallback_from, fallback_reason, unavailable_reason.
     """
-    meta: dict = {"requested_provider": provider}
+    meta: dict[str, Any] = {"requested_provider": provider}
 
     if provider == "auto":
         # 1. local if model path configured and file exists
@@ -235,6 +236,7 @@ def create_embedding_provider(
             path = local.model_path
             if not path.startswith("hf:") and not path.startswith("http"):
                 import os as _os
+
                 if _os.path.isfile(_os.path.expanduser(path)):
                     try:
                         p = _create_for_id("local", model, remote, local)
@@ -255,7 +257,11 @@ def create_embedding_provider(
                 raise
 
         # All failed due to missing keys → FTS-only
-        reason = "\n\n".join(missing_key_errors) if missing_key_errors else "No embeddings provider available."
+        reason = (
+            "\n\n".join(missing_key_errors)
+            if missing_key_errors
+            else "No embeddings provider available."
+        )
         meta["unavailable_reason"] = reason
         return None, meta
 

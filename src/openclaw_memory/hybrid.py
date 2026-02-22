@@ -2,9 +2,11 @@
 Hybrid BM25 + vector search merging.
 Mirrors: src/memory/hybrid.ts
 """
+
 from __future__ import annotations
 
 import re
+from typing import Any
 
 from .mmr import MMRConfig, apply_mmr_to_hybrid_results
 from .temporal_decay import TemporalDecayConfig, apply_temporal_decay_to_results
@@ -19,7 +21,7 @@ def build_fts_query(raw: str) -> str | None:
     tokens = [t.strip() for t in tokens if t.strip()]
     if not tokens:
         return None
-    quoted = ['"' + t.replace('"', '') + '"' for t in tokens]
+    quoted = ['"' + t.replace('"', "") + '"' for t in tokens]
     return " AND ".join(quoted)
 
 
@@ -34,15 +36,15 @@ def bm25_rank_to_score(rank: float) -> float:
 
 def merge_hybrid_results(
     *,
-    vector: list[dict],
-    keyword: list[dict],
+    vector: list[dict[str, Any]],
+    keyword: list[dict[str, Any]],
     vector_weight: float,
     text_weight: float,
-    mmr: dict | None = None,
-    temporal_decay: dict | None = None,
+    mmr: dict[str, Any] | None = None,
+    temporal_decay: dict[str, Any] | None = None,
     workspace_dir: str | None = None,
     now_ms: float | None = None,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """
     Merge vector and keyword results into a unified ranked list.
 
@@ -53,7 +55,7 @@ def merge_hybrid_results(
 
     Mirrors: hybrid.ts::mergeHybridResults
     """
-    by_id: dict[str, dict] = {}
+    by_id: dict[str, dict[str, Any]] = {}
 
     for r in vector:
         by_id[r["id"]] = {

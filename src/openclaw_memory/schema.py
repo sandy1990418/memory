@@ -2,9 +2,19 @@
 SQLite schema creation for the memory index.
 Mirrors: src/memory/memory-schema.ts
 """
+
 from __future__ import annotations
 
+import re
 import sqlite3
+
+_SAFE_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _validate_identifier(name: str) -> None:
+    """Reject SQL identifiers that aren't simple alphanumeric names."""
+    if not _SAFE_IDENTIFIER.match(name):
+        raise ValueError(f"Invalid SQL identifier: {name!r}")
 
 
 def ensure_memory_index_schema(
@@ -18,6 +28,9 @@ def ensure_memory_index_schema(
     Create all required tables and indexes.
     Returns {"fts_available": bool, "fts_error": str | None}.
     """
+    _validate_identifier(embedding_cache_table)
+    _validate_identifier(fts_table)
+
     cur = db.cursor()
 
     cur.executescript("""
@@ -97,6 +110,8 @@ def ensure_memory_index_schema(
 
 
 def _ensure_column(cur: sqlite3.Cursor, table: str, column: str, definition: str) -> None:
+    _validate_identifier(table)
+    _validate_identifier(column)
     cur.execute(f"PRAGMA table_info({table})")
     rows = cur.fetchall()
     existing = {row[1] for row in rows}

@@ -2,14 +2,14 @@
 CLI entrypoint for openclaw-memory (ocmem).
 Mirrors: src/cli/memory-cli.ts
 """
+
 from __future__ import annotations
 
 import json
 import os
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any
 
 import typer
 from rich.console import Console
@@ -30,22 +30,20 @@ err_console = Console(stderr=True)
 
 
 def _resolve_workspace(workspace: str | None) -> str:
-    return (
-        workspace
-        or os.environ.get("OPENCLAW_WORKSPACE")
-        or os.getcwd()
-    )
+    return workspace or os.environ.get("OPENCLAW_WORKSPACE") or os.getcwd()
 
 
 def _resolve_db_path(workspace: str) -> str:
     from_env = os.environ.get("OPENCLAW_DB_PATH")
     if from_env:
         return from_env
-    state_dir = os.environ.get("OPENCLAW_STATE_DIR", os.path.join(os.path.expanduser("~"), ".openclaw"))
+    state_dir = os.environ.get(
+        "OPENCLAW_STATE_DIR", os.path.join(os.path.expanduser("~"), ".openclaw")
+    )
     return os.path.join(state_dir, "memory", "main.sqlite")
 
 
-def _get_manager(workspace: str | None = None):
+def _get_manager(workspace: str | None = None) -> Any:
     """Create a MemoryIndexManager from env config."""
     from ..manager import MemoryIndexManager
 
@@ -68,9 +66,11 @@ def _today_date_str(date_override: str | None) -> str:
 @app.command()
 def search(
     query: str = typer.Argument(..., help="Search query"),
-    max_results: Optional[int] = typer.Option(None, "--max-results", "-n", help="Maximum results"),
-    min_score: Optional[float] = typer.Option(None, "--min-score", help="Minimum score threshold"),
-    workspace: Optional[str] = typer.Option(None, "--workspace", "-w", help="Workspace directory", envvar="OPENCLAW_WORKSPACE"),
+    max_results: int | None = typer.Option(None, "--max-results", "-n", help="Maximum results"),
+    min_score: float | None = typer.Option(None, "--min-score", help="Minimum score threshold"),
+    workspace: str | None = typer.Option(
+        None, "--workspace", "-w", help="Workspace directory", envvar="OPENCLAW_WORKSPACE"
+    ),
     output_json: bool = typer.Option(False, "--json", help="Output as JSON"),
 ) -> None:
     """Search the memory index."""
@@ -96,17 +96,21 @@ def search(
             )
 
         if output_json:
-            console.print_json(json.dumps([
-                {
-                    "path": r.path,
-                    "start_line": r.start_line,
-                    "end_line": r.end_line,
-                    "score": r.score,
-                    "snippet": r.snippet,
-                    "source": r.source,
-                }
-                for r in results
-            ]))
+            console.print_json(
+                json.dumps(
+                    [
+                        {
+                            "path": r.path,
+                            "start_line": r.start_line,
+                            "end_line": r.end_line,
+                            "score": r.score,
+                            "snippet": r.snippet,
+                            "source": r.source,
+                        }
+                        for r in results
+                    ]
+                )
+            )
             return
 
         if not results:
@@ -132,10 +136,14 @@ def search(
 
 @app.command()
 def get(
-    path: str = typer.Argument(..., help="Relative path to memory file (e.g. MEMORY.md or memory/2024-01-01.md)"),
-    from_line: Optional[int] = typer.Option(None, "--from", help="Start line (1-indexed)"),
-    lines: Optional[int] = typer.Option(None, "--lines", help="Number of lines to read"),
-    workspace: Optional[str] = typer.Option(None, "--workspace", "-w", help="Workspace directory", envvar="OPENCLAW_WORKSPACE"),
+    path: str = typer.Argument(
+        ..., help="Relative path to memory file (e.g. MEMORY.md or memory/2024-01-01.md)"
+    ),
+    from_line: int | None = typer.Option(None, "--from", help="Start line (1-indexed)"),
+    lines: int | None = typer.Option(None, "--lines", help="Number of lines to read"),
+    workspace: str | None = typer.Option(
+        None, "--workspace", "-w", help="Workspace directory", envvar="OPENCLAW_WORKSPACE"
+    ),
 ) -> None:
     """Read a memory file (or slice of it)."""
     try:
@@ -164,8 +172,12 @@ def get(
 @app.command(name="append-daily")
 def append_daily(
     text: str = typer.Argument(..., help="Text to append to today's daily memory file"),
-    workspace: Optional[str] = typer.Option(None, "--workspace", "-w", help="Workspace directory", envvar="OPENCLAW_WORKSPACE"),
-    date: Optional[str] = typer.Option(None, "--date", help="Date override (YYYY-MM-DD, default: today UTC)"),
+    workspace: str | None = typer.Option(
+        None, "--workspace", "-w", help="Workspace directory", envvar="OPENCLAW_WORKSPACE"
+    ),
+    date: str | None = typer.Option(
+        None, "--date", help="Date override (YYYY-MM-DD, default: today UTC)"
+    ),
 ) -> None:
     """
     Append text to memory/YYYY-MM-DD.md (creates the file if needed).
@@ -214,7 +226,9 @@ def append_daily(
 def index(
     force: bool = typer.Option(False, "--force", help="Force full reindex"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
-    workspace: Optional[str] = typer.Option(None, "--workspace", "-w", help="Workspace directory", envvar="OPENCLAW_WORKSPACE"),
+    workspace: str | None = typer.Option(
+        None, "--workspace", "-w", help="Workspace directory", envvar="OPENCLAW_WORKSPACE"
+    ),
 ) -> None:
     """Reindex memory files."""
     try:
@@ -227,8 +241,13 @@ def index(
         with mgr:
             if verbose:
                 st = mgr.status()
-                console.print(f"[bold]Memory Index[/bold] [dim](workspace: {st.workspace_dir})[/dim]")
-                console.print(f"[dim]Provider:[/dim] [cyan]{st.provider}[/cyan]  [dim]Model:[/dim] [cyan]{st.model or 'none'}[/cyan]")
+                console.print(
+                    f"[bold]Memory Index[/bold] [dim](workspace: {st.workspace_dir})[/dim]"
+                )
+                console.print(
+                    f"[dim]Provider:[/dim] [cyan]{st.provider}[/cyan]  "
+                    f"[dim]Model:[/dim] [cyan]{st.model or 'none'}[/cyan]"
+                )
                 console.print()
 
             completed_ref = [0]
@@ -258,7 +277,9 @@ def index(
 def status(
     output_json: bool = typer.Option(False, "--json", help="Output as JSON"),
     deep: bool = typer.Option(False, "--deep", help="Probe embedding availability"),
-    workspace: Optional[str] = typer.Option(None, "--workspace", "-w", help="Workspace directory", envvar="OPENCLAW_WORKSPACE"),
+    workspace: str | None = typer.Option(
+        None, "--workspace", "-w", help="Workspace directory", envvar="OPENCLAW_WORKSPACE"
+    ),
 ) -> None:
     """Show memory index status."""
     try:
@@ -275,7 +296,7 @@ def status(
                 embedding_probe = mgr.probe_embedding_availability()
 
         if output_json:
-            data: dict = {
+            data: dict[str, Any] = {
                 "backend": st.backend,
                 "provider": st.provider,
                 "model": st.model,
@@ -297,12 +318,16 @@ def status(
             return
 
         # Human-readable output
-        console.print(f"[bold]Memory Search[/bold]")
+        console.print("[bold]Memory Search[/bold]")
         console.print(f"  [dim]Provider:[/dim]  [cyan]{st.provider}[/cyan]")
         if st.model:
             console.print(f"  [dim]Model:[/dim]     [cyan]{st.model}[/cyan]")
-        console.print(f"  [dim]Indexed:[/dim]   [green]{st.files} files · {st.chunks} chunks[/green]")
-        console.print(f"  [dim]Dirty:[/dim]     {'[yellow]yes[/yellow]' if st.dirty else '[dim]no[/dim]'}")
+        console.print(
+            f"  [dim]Indexed:[/dim]   [green]{st.files} files · {st.chunks} chunks[/green]"
+        )
+        console.print(
+            f"  [dim]Dirty:[/dim]     {'[yellow]yes[/yellow]' if st.dirty else '[dim]no[/dim]'}"
+        )
         if st.workspace_dir:
             console.print(f"  [dim]Workspace:[/dim] [cyan]{st.workspace_dir}[/cyan]")
         if st.db_path:
@@ -311,8 +336,16 @@ def status(
             console.print(f"  [dim]Sources:[/dim]   [cyan]{', '.join(st.sources)}[/cyan]")
 
         if st.fts:
-            fts_state = "ready" if st.fts.get("available") else ("disabled" if not st.fts.get("enabled") else "unavailable")
-            fts_style = "green" if fts_state == "ready" else ("dim" if fts_state == "disabled" else "yellow")
+            fts_state = (
+                "ready"
+                if st.fts.get("available")
+                else ("disabled" if not st.fts.get("enabled") else "unavailable")
+            )
+            fts_style = (
+                "green"
+                if fts_state == "ready"
+                else ("dim" if fts_state == "disabled" else "yellow")
+            )
             console.print(f"  [dim]FTS:[/dim]       [{fts_style}]{fts_state}[/{fts_style}]")
 
         if embedding_probe:
@@ -328,8 +361,12 @@ def status(
         if st.cache:
             cache_state = "enabled" if st.cache.get("enabled") else "disabled"
             cache_style = "green" if st.cache.get("enabled") else "dim"
-            suffix = f" ({st.cache['entries']} entries)" if st.cache.get("entries") is not None else ""
-            console.print(f"  [dim]Cache:[/dim]     [{cache_style}]{cache_state}{suffix}[/{cache_style}]")
+            suffix = (
+                f" ({st.cache['entries']} entries)" if st.cache.get("entries") is not None else ""
+            )
+            console.print(
+                f"  [dim]Cache:[/dim]     [{cache_style}]{cache_state}{suffix}[/{cache_style}]"
+            )
 
     except Exception as exc:
         err_console.print(f"[red]Status failed:[/red] {exc}")

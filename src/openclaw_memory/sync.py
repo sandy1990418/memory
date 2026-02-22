@@ -2,23 +2,23 @@
 Memory file sync: walk files, chunk, embed, upsert into SQLite.
 Mirrors: src/memory/sync-memory-files.ts, sync-index.ts, sync-stale.ts
 """
+
 from __future__ import annotations
 
 import json
 import sqlite3
 import time
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from .internal import (
     MemoryFileEntry,
     build_file_entry,
     chunk_markdown,
     hash_chunk_id,
-    hash_text,
     list_memory_files,
     normalize_extra_memory_paths,
 )
-
 
 # ---------------------------------------------------------------------------
 # Upsert helpers
@@ -75,7 +75,18 @@ def _upsert_chunk(
         "INSERT OR REPLACE INTO chunks "
         "(id, path, source, start_line, end_line, hash, model, text, embedding, updated_at) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (chunk_id, path, source, start_line, end_line, chunk_hash, model, text, embedding_json, updated_at),
+        (
+            chunk_id,
+            path,
+            source,
+            start_line,
+            end_line,
+            chunk_hash,
+            model,
+            text,
+            embedding_json,
+            updated_at,
+        ),
     )
     if fts_available:
         try:
@@ -111,6 +122,7 @@ def _get_cached_embedding(
     ).fetchone()
     if row:
         from .internal import parse_embedding
+
         return parse_embedding(row[0])
     return None
 
@@ -148,6 +160,7 @@ def index_file_entry_if_changed(
     model: str,
     provider: Any | None,
     provider_id: str,
+    provider_key: str = "",
     fts_table: str,
     fts_available: bool,
     chunk_tokens: int = 400,
@@ -169,12 +182,15 @@ def index_file_entry_if_changed(
 
     # Read content and chunk
     from pathlib import Path
+
     content = Path(entry.abs_path).read_text(encoding="utf-8")
     chunks = chunk_markdown(content, (chunk_tokens, chunk_overlap))
 
     # Delete old chunks
     _delete_chunks_for_path(
-        db, entry.path, source,
+        db,
+        entry.path,
+        source,
         fts_table=fts_table,
         fts_available=fts_available,
         model=model,
@@ -195,7 +211,7 @@ def index_file_entry_if_changed(
                     db,
                     provider=provider_id,
                     model=model,
-                    provider_key="",
+                    provider_key=provider_key,
                     text_hash=chunk.hash,
                 )
             if cached is not None:
@@ -208,7 +224,7 @@ def index_file_entry_if_changed(
                             db,
                             provider=provider_id,
                             model=model,
-                            provider_key="",
+                            provider_key=provider_key,
                             text_hash=chunk.hash,
                             embedding=embedding,
                         )
@@ -251,13 +267,13 @@ def delete_stale_indexed_paths(
     model: str,
 ) -> None:
     """Remove chunks/files for paths that no longer exist on disk."""
-    rows = db.execute(
-        "SELECT path FROM files WHERE source = ?", (source,)
-    ).fetchall()
+    rows = db.execute("SELECT path FROM files WHERE source = ?", (source,)).fetchall()
     for (path,) in rows:
         if path not in active_paths:
             _delete_chunks_for_path(
-                db, path, source,
+                db,
+                path,
+                source,
                 fts_table=fts_table,
                 fts_available=fts_available,
                 model=model,
@@ -283,6 +299,7 @@ def sync_memory_files(
     model: str,
     provider: Any | None,
     provider_id: str,
+    provider_key: str = "",
     fts_table: str,
     fts_available: bool,
     chunk_tokens: int = 400,
@@ -306,11 +323,14 @@ def sync_memory_files(
             progress_callback(i, total, f"Indexing {entry.path}")
         try:
             index_file_entry_if_changed(
-                db, entry, source,
+                db,
+                entry,
+                source,
                 needs_full_reindex=needs_full_reindex,
                 model=model,
                 provider=provider,
                 provider_id=provider_id,
+                provider_key=provider_key,
                 fts_table=fts_table,
                 fts_available=fts_available,
                 chunk_tokens=chunk_tokens,

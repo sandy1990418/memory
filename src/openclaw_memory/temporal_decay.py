@@ -2,6 +2,7 @@
 Temporal decay scoring for memory search results.
 Mirrors: src/memory/temporal-decay.ts
 """
+
 from __future__ import annotations
 
 import math
@@ -9,6 +10,7 @@ import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Any
 
 
 @dataclass
@@ -80,11 +82,7 @@ def _extract_timestamp(
     if not workspace_dir:
         return None
 
-    abs_path = (
-        file_path
-        if os.path.isabs(file_path)
-        else os.path.join(workspace_dir, file_path)
-    )
+    abs_path = file_path if os.path.isabs(file_path) else os.path.join(workspace_dir, file_path)
     try:
         mtime = os.stat(abs_path).st_mtime
         if not math.isfinite(mtime):
@@ -95,12 +93,12 @@ def _extract_timestamp(
 
 
 def apply_temporal_decay_to_results(
-    results: list[dict],
+    results: list[dict[str, Any]],
     *,
     config: TemporalDecayConfig | None = None,
     workspace_dir: str | None = None,
     now_ms: float | None = None,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """
     Apply temporal decay to a list of result dicts.
     Each dict must have: path, score, source.
@@ -111,10 +109,11 @@ def apply_temporal_decay_to_results(
         return list(results)
 
     import time as _time
+
     now_ms_actual = now_ms if now_ms is not None else _time.time() * 1000
 
     timestamp_cache: dict[str, datetime | None] = {}
-    out: list[dict] = []
+    out: list[dict[str, Any]] = []
 
     for entry in results:
         file_path = entry.get("path", "")

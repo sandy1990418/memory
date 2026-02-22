@@ -7,16 +7,17 @@ Public API:
     MemoryProviderStatus — index status dataclass
     resolve_memory_search_config — config resolution from env vars
 """
+
+from .config import ResolvedMemorySearchConfig, resolve_memory_search_config
 from .manager import MemoryIndexManager
 from .types import (
     MemoryChunk,
     MemoryEmbeddingProbeResult,
     MemoryFileEntry,
-    MemorySearchResult,
     MemoryProviderStatus,
+    MemorySearchResult,
     MemorySyncProgressUpdate,
 )
-from .config import resolve_memory_search_config, ResolvedMemorySearchConfig
 
 __all__ = [
     "MemoryIndexManager",

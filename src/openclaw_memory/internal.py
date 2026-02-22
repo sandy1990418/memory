@@ -2,17 +2,31 @@
 File walking, chunking, hashing, and cosine similarity utilities.
 Mirrors: src/memory/internal.ts
 """
+
 from __future__ import annotations
 
 import hashlib
 import json
 import os
-import stat
+from collections.abc import Generator
 from pathlib import Path
-from typing import Generator
 
 from .types import MemoryChunk, MemoryFileEntry
 
+__all__ = [
+    "MemoryFileEntry",
+    "MemoryChunk",
+    "normalize_rel_path",
+    "is_memory_path",
+    "normalize_extra_memory_paths",
+    "build_file_entry",
+    "list_memory_files",
+    "chunk_markdown",
+    "hash_chunk_id",
+    "hash_text",
+    "cosine_similarity",
+    "truncate_utf16_safe",
+]
 
 # ---------------------------------------------------------------------------
 # Path utilities
@@ -146,7 +160,7 @@ def hash_text(value: str) -> str:
 def hash_chunk_id(path: str, start_line: int, end_line: int, chunk_hash: str) -> str:
     """Derive a stable 16-hex-char chunk ID."""
     raw = f"{path}:{start_line}:{end_line}:{chunk_hash}"
-    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
 # ---------------------------------------------------------------------------
@@ -198,15 +212,17 @@ def chunk_markdown(
     def flush() -> None:
         if not current:
             return
-        text = "\n".join(l for l, _ in current)
+        text = "\n".join(ln for ln, _ in current)
         start_line = current[0][1]
         end_line = current[-1][1]
-        chunks.append(MemoryChunk(
-            start_line=start_line,
-            end_line=end_line,
-            text=text,
-            hash=hash_text(text),
-        ))
+        chunks.append(
+            MemoryChunk(
+                start_line=start_line,
+                end_line=end_line,
+                text=text,
+                hash=hash_text(text),
+            )
+        )
 
     def carry_overlap() -> tuple[list[tuple[str, int]], int]:
         if overlap_chars <= 0 or not current:
@@ -218,13 +234,17 @@ def chunk_markdown(
             kept.insert(0, (line, lineno))
             if acc >= overlap_chars:
                 break
-        new_chars = sum(len(l) + 1 for l, _ in kept)
+        new_chars = sum(len(ln) + 1 for ln, _ in kept)
         return kept, new_chars
 
     for i, line in enumerate(lines):
         line_no = i + 1
         # Split long lines into segments
-        segments = [line[j: j + max_chars] for j in range(0, max(1, len(line)), max_chars)] if line else [""]
+        segments = (
+            [line[j : j + max_chars] for j in range(0, max(1, len(line)), max_chars)]
+            if line
+            else [""]
+        )
 
         for segment in segments:
             line_size = len(segment) + 1
@@ -279,7 +299,7 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
         norm_b += bv * bv
     if norm_a == 0.0 or norm_b == 0.0:
         return 0.0
-    return dot / ((norm_a ** 0.5) * (norm_b ** 0.5))
+    return float(dot / ((norm_a**0.5) * (norm_b**0.5)))
 
 
 def truncate_utf16_safe(text: str, max_chars: int) -> str:
