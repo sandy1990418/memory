@@ -92,6 +92,58 @@ def _extract_timestamp(
         return None
 
 
+def apply_temporal_decay_by_created_at(
+    results: list[dict[str, Any]],
+    *,
+    config: TemporalDecayConfig | None = None,
+    now_ms: float | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Apply temporal decay using a ``created_at`` field already present in each
+    result dict (e.g. a ``datetime`` or ISO-8601 string from PostgreSQL).
+
+    Each dict must have: score, created_at.
+    Existing file-path-based functions are left unchanged.
+    """
+    import time as _time
+
+    cfg = config or DEFAULT_TEMPORAL_DECAY_CONFIG
+    if not cfg.enabled:
+        return list(results)
+
+    now_ms_actual = now_ms if now_ms is not None else _time.time() * 1000
+    out: list[dict[str, Any]] = []
+
+    for entry in results:
+        created_at = entry.get("created_at")
+        if created_at is None:
+            out.append(entry)
+            continue
+
+        if isinstance(created_at, str):
+            try:
+                ts_dt = datetime.fromisoformat(created_at)
+                if ts_dt.tzinfo is None:
+                    ts_dt = ts_dt.replace(tzinfo=timezone.utc)
+            except (ValueError, OverflowError):
+                out.append(entry)
+                continue
+        elif isinstance(created_at, datetime):
+            ts_dt = created_at
+            if ts_dt.tzinfo is None:
+                ts_dt = ts_dt.replace(tzinfo=timezone.utc)
+        else:
+            out.append(entry)
+            continue
+
+        age_ms = max(0.0, now_ms_actual - ts_dt.timestamp() * 1000)
+        age_days = age_ms / _DAY_MS
+        decayed_score = apply_temporal_decay_to_score(entry["score"], age_days, cfg.half_life_days)
+        out.append({**entry, "score": decayed_score})
+
+    return out
+
+
 def apply_temporal_decay_to_results(
     results: list[dict[str, Any]],
     *,

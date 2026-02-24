@@ -109,6 +109,15 @@ class ExperimentalConfig:
     session_memory: bool = False
 
 
+@dataclass
+class PostgresConfig:
+    """Connection and pool settings for the PostgreSQL backend."""
+
+    dsn: str = ""
+    pool_min: int = 2
+    pool_max: int = 10
+
+
 # ---------------------------------------------------------------------------
 # Top-level resolved config
 # ---------------------------------------------------------------------------
