@@ -13,3 +13,5 @@ build/
 .coverage
 htmlcov/
 .DS_Store
+.cluade/
+openspec/
