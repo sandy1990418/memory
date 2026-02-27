@@ -36,7 +36,7 @@ from .types import MemorySearchResult
 from .working_memory import DBWorkingMemory, WorkingMemory
 
 if TYPE_CHECKING:
-    import psycopg  # type: ignore[import]
+    import psycopg
 
 
 # ---------------------------------------------------------------------------
@@ -148,7 +148,7 @@ class MemoryService:
             VALUES (%s, %s, %s::vector, %s, %s)
         """
         embedding_str = "[" + ",".join(str(v) for v in embedding) + "]"
-        with conn.cursor() as cur:  # type: ignore[attr-defined]
+        with conn.cursor() as cur:
             cur.execute(
                 sql,
                 (
@@ -174,7 +174,7 @@ class MemoryService:
             INSERT INTO episodic_memories (user_id, thread_id, content, embedding, memory_type)
             VALUES (%s, %s, %s, %s::vector, 'session')
         """
-        with conn.cursor() as cur:  # type: ignore[attr-defined]
+        with conn.cursor() as cur:
             cur.execute(sql, (user_id, thread_id, content, embedding_str))
 
     # ------------------------------------------------------------------
@@ -265,7 +265,7 @@ class MemoryService:
                 conn, user_id, keyword_query, limit=20, table="semantic_memories"
             )
         finally:
-            conn.close()  # type: ignore[attr-defined]
+            conn.close()
 
         # Combine all vector/keyword results
         all_vector = episodic_vec + semantic_vec
@@ -337,7 +337,7 @@ class MemoryService:
         self,
         user_id: str,
         thread_id: str,
-        conversation: list[dict],
+        conversation: list[dict[str, Any]],
     ) -> dict[str, Any]:
         """
         Full write pipeline: extract → classify → store.
@@ -355,7 +355,7 @@ class MemoryService:
         inserted = 0
         conn = self._get_conn()
         try:
-            conn.autocommit = False  # type: ignore[attr-defined]
+            conn.autocommit = False
             for mem in memories:
                 # Classify: "fact"/"preference"/"decision" → semantic; "event" → episodic
                 table = (
@@ -365,12 +365,12 @@ class MemoryService:
                 )
                 self._store_memory(conn, user_id, mem, table=table)
                 inserted += 1
-            conn.commit()  # type: ignore[attr-defined]
+            conn.commit()
         except Exception:
-            conn.rollback()  # type: ignore[attr-defined]
+            conn.rollback()
             raise
         finally:
-            conn.close()  # type: ignore[attr-defined]
+            conn.close()
 
         # Update working memory
         if self._working_memory is not None:
@@ -382,7 +382,7 @@ class MemoryService:
         self,
         user_id: str,
         thread_id: str,
-        conversation: list[dict],
+        conversation: list[dict[str, Any]],
     ) -> None:
         """
         Called on session end — saves raw conversation as an episodic memory.
@@ -401,14 +401,14 @@ class MemoryService:
 
         conn = self._get_conn()
         try:
-            conn.autocommit = False  # type: ignore[attr-defined]
+            conn.autocommit = False
             self._store_raw_episode(conn, user_id, thread_id, content)
-            conn.commit()  # type: ignore[attr-defined]
+            conn.commit()
         except Exception:
-            conn.rollback()  # type: ignore[attr-defined]
+            conn.rollback()
             raise
         finally:
-            conn.close()  # type: ignore[attr-defined]
+            conn.close()
 
         # Clear working memory after session is saved
         if self._working_memory is not None:
@@ -417,7 +417,7 @@ class MemoryService:
     def memory_flush(
         self,
         user_id: str,
-        conversation: list[dict],
+        conversation: list[dict[str, Any]],
     ) -> dict[str, Any]:
         """
         Called when context is near-full — extract durable memories and store.
@@ -435,7 +435,7 @@ class MemoryService:
         inserted = 0
         conn = self._get_conn()
         try:
-            conn.autocommit = False  # type: ignore[attr-defined]
+            conn.autocommit = False
             for mem in memories:
                 table = (
                     "episodic_memories"
@@ -444,12 +444,12 @@ class MemoryService:
                 )
                 self._store_memory(conn, user_id, mem, table=table)
                 inserted += 1
-            conn.commit()  # type: ignore[attr-defined]
+            conn.commit()
         except Exception:
-            conn.rollback()  # type: ignore[attr-defined]
+            conn.rollback()
             raise
         finally:
-            conn.close()  # type: ignore[attr-defined]
+            conn.close()
 
         return {"inserted": inserted}
 
@@ -466,11 +466,11 @@ class MemoryService:
         sql = "SELECT profile FROM user_profiles WHERE user_id = %s"
         conn = self._get_conn()
         try:
-            with conn.cursor() as cur:  # type: ignore[attr-defined]
+            with conn.cursor() as cur:
                 cur.execute(sql, (user_id,))
                 row = cur.fetchone()
         finally:
-            conn.close()  # type: ignore[attr-defined]
+            conn.close()
 
         if row is None:
             return {}
@@ -498,12 +498,12 @@ class MemoryService:
         """
         conn = self._get_conn()
         try:
-            conn.autocommit = False  # type: ignore[attr-defined]
-            with conn.cursor() as cur:  # type: ignore[attr-defined]
+            conn.autocommit = False
+            with conn.cursor() as cur:
                 cur.execute(sql, (user_id, json.dumps(updates)))
-            conn.commit()  # type: ignore[attr-defined]
+            conn.commit()
         except Exception:
-            conn.rollback()  # type: ignore[attr-defined]
+            conn.rollback()
             raise
         finally:
-            conn.close()  # type: ignore[attr-defined]
+            conn.close()

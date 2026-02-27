@@ -6,6 +6,7 @@ Inspired by Memobase's buffered-flush pattern.
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import Any
 
 from .dedup import DBConnection, store_with_dedup
 from .embeddings import EmbeddingProvider
@@ -35,13 +36,13 @@ class MemoryBatchProcessor:
         self.similarity_threshold = similarity_threshold
 
         # user_id -> list of message dicts
-        self._buffer: dict[str, list[dict]] = {}
+        self._buffer: dict[str, list[dict[str, Any]]] = {}
 
     # ------------------------------------------------------------------
     # Buffering
     # ------------------------------------------------------------------
 
-    def buffer_conversation(self, user_id: str, messages: list[dict]) -> None:
+    def buffer_conversation(self, user_id: str, messages: list[dict[str, Any]]) -> None:
         """
         Add *messages* to the per-user buffer.
         Automatically flushes when the buffer reaches *buffer_size*.

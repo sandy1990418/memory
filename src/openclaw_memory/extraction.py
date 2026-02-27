@@ -9,6 +9,7 @@ import json
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import Any
 
 EXTRACTION_PROMPT = (
     "You are a memory extraction assistant. "
@@ -36,7 +37,7 @@ class ExtractedMemory:
     content: str
     memory_type: str  # "preference" | "fact" | "decision" | "event"
     confidence: float  # 0.0–1.0
-    metadata: dict = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 def _format_conversation(conversation: list[dict[str, str]]) -> str:

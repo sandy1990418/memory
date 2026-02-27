@@ -15,7 +15,7 @@ import json
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    pass  # type: ignore[import]
+    pass
 
 _MAX_WORKING_MESSAGES = 20
 
@@ -55,7 +55,7 @@ class WorkingMemory:
     def _key(user_id: str, thread_id: str) -> str:
         return f"wm:{user_id}:{thread_id}"
 
-    def get(self, user_id: str, thread_id: str) -> list[dict] | None:
+    def get(self, user_id: str, thread_id: str) -> list[dict[str, Any]] | None:
         """
         Retrieve messages for a given user/thread.
 
@@ -67,11 +67,12 @@ class WorkingMemory:
             raw = self._client.get(self._key(user_id, thread_id))
             if raw is None:
                 return None
-            return json.loads(raw)
+            result: list[dict[str, Any]] = json.loads(raw)
+            return result
         except Exception:
             return None
 
-    def set(self, user_id: str, thread_id: str, messages: list[dict]) -> None:
+    def set(self, user_id: str, thread_id: str, messages: list[dict[str, Any]]) -> None:
         """
         Store messages for a given user/thread with TTL.
 
@@ -172,16 +173,16 @@ class DBWorkingMemory:
         """
         conn = self._conn_factory()
         try:
-            conn.autocommit = False  # type: ignore[attr-defined]
-            with conn.cursor() as cur:  # type: ignore[attr-defined]
+            conn.autocommit = False
+            with conn.cursor() as cur:
                 cur.execute(_SQL_INSERT, (user_id, role, content))
                 cur.execute(_SQL_PRUNE, (user_id, user_id, self._max_messages))
-            conn.commit()  # type: ignore[attr-defined]
+            conn.commit()
         except Exception:
-            conn.rollback()  # type: ignore[attr-defined]
+            conn.rollback()
             raise
         finally:
-            conn.close()  # type: ignore[attr-defined]
+            conn.close()
 
     def get_recent(self, user_id: str, limit: int = _MAX_WORKING_MESSAGES) -> list[dict[str, Any]]:
         """
@@ -191,11 +192,11 @@ class DBWorkingMemory:
         """
         conn = self._conn_factory()
         try:
-            with conn.cursor() as cur:  # type: ignore[attr-defined]
+            with conn.cursor() as cur:
                 cur.execute(_SQL_SELECT_RECENT, (user_id, limit))
                 rows = cur.fetchall()
         finally:
-            conn.close()  # type: ignore[attr-defined]
+            conn.close()
 
         return [
             {"role": row[0], "content": row[1], "created_at": row[2]}
@@ -206,12 +207,12 @@ class DBWorkingMemory:
         """Delete all working-memory messages for *user_id*."""
         conn = self._conn_factory()
         try:
-            conn.autocommit = False  # type: ignore[attr-defined]
-            with conn.cursor() as cur:  # type: ignore[attr-defined]
+            conn.autocommit = False
+            with conn.cursor() as cur:
                 cur.execute(_SQL_DELETE_USER, (user_id,))
-            conn.commit()  # type: ignore[attr-defined]
+            conn.commit()
         except Exception:
-            conn.rollback()  # type: ignore[attr-defined]
+            conn.rollback()
             raise
         finally:
-            conn.close()  # type: ignore[attr-defined]
+            conn.close()

@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    import psycopg  # type: ignore[import]
+    import psycopg
 
 _VALID_TABLES = frozenset({"episodic_memories", "semantic_memories"})
 
@@ -22,7 +22,7 @@ def _validate_table(table: str) -> str:
 
 
 def pg_search_vector(
-    conn: "psycopg.Connection[Any]",
+    conn: psycopg.Connection[Any],
     user_id: str,
     query_vec: list[float],
     limit: int = 20,
@@ -47,7 +47,7 @@ def pg_search_vector(
         source_filter: Optional ``memory_type`` filter (parameterised).
     """
     try:
-        import psycopg  # noqa: F401  # type: ignore[import]
+        import psycopg  # noqa: F401
     except ImportError as exc:
         raise ImportError(
             "psycopg (psycopg3) is required for PostgreSQL support. "
@@ -81,7 +81,7 @@ def pg_search_vector(
     # Insert it just before the LIMIT param.
     params.insert(-1, query_vec)
 
-    with conn.cursor() as cur:  # type: ignore[attr-defined]
+    with conn.cursor() as cur:
         cur.execute(sql, params)
         rows = cur.fetchall()
 
@@ -104,7 +104,7 @@ def pg_search_vector(
 
 
 def pg_search_keyword(
-    conn: "psycopg.Connection[Any]",
+    conn: psycopg.Connection[Any],
     user_id: str,
     query: str,
     limit: int = 20,
@@ -129,7 +129,7 @@ def pg_search_keyword(
         source_filter: Optional ``memory_type`` filter (parameterised).
     """
     try:
-        import psycopg  # noqa: F401  # type: ignore[import]
+        import psycopg  # noqa: F401
     except ImportError as exc:
         raise ImportError(
             "psycopg (psycopg3) is required for PostgreSQL support. "
@@ -162,7 +162,7 @@ def pg_search_keyword(
     # plainto_tsquery is referenced twice; insert second copy before LIMIT.
     params.insert(-1, query)
 
-    with conn.cursor() as cur:  # type: ignore[attr-defined]
+    with conn.cursor() as cur:
         cur.execute(sql, params)
         rows = cur.fetchall()
 

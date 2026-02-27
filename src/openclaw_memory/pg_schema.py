@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     # Only imported for type-checking; psycopg is lazy-loaded at runtime.
-    import psycopg  # type: ignore[import]
+    import psycopg
 
 # Path to the bundled SQL migration file.
 _MIGRATION_SQL = Path(__file__).parent.parent.parent / "migrations" / "001_initial_schema.sql"
@@ -132,7 +132,7 @@ def get_pg_connection(dsn: str) -> psycopg.Connection[Any]:
         psycopg.OperationalError: if the connection cannot be established.
     """
     try:
-        import psycopg  # type: ignore[import]
+        import psycopg  # noqa: F401  # pyright: ignore[reportMissingImports]
     except ImportError as exc:
         raise ImportError(
             "psycopg (psycopg3) is required for PostgreSQL support. "
@@ -174,10 +174,10 @@ def ensure_pg_schema(conn: psycopg.Connection[Any]) -> None:
 
     # psycopg3: autocommit must be True to run CREATE EXTENSION / CREATE INDEX
     # CONCURRENTLY outside a transaction block.  We toggle it for the duration.
-    prior_autocommit: bool = conn.autocommit  # type: ignore[attr-defined]
+    prior_autocommit: bool = conn.autocommit
     try:
-        conn.autocommit = True  # type: ignore[attr-defined]
-        with conn.cursor() as cur:  # type: ignore[attr-defined]
-            cur.execute(sql)  # type: ignore[arg-type]
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute(sql)
     finally:
-        conn.autocommit = prior_autocommit  # type: ignore[attr-defined]
+        conn.autocommit = prior_autocommit
