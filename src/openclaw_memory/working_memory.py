@@ -1,15 +1,23 @@
 """
-Redis-based L1 working memory (short-term, per-session context).
+Working memory backends for short-term, per-user context.
 
 Provides:
-  - WorkingMemory — wraps Redis with per-user/thread key scoping and TTL.
+  - WorkingMemory     — Redis-backed, per-user/thread, TTL-based.
     Gracefully degrades (returns None / no-ops) if Redis is unavailable.
+  - DBWorkingMemory   — PostgreSQL-backed, per-user, max N messages.
+    Inserts messages, retrieves the most recent N in chronological order,
+    and prunes older messages when the per-user cap is exceeded.
 """
 
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    pass  # type: ignore[import]
+
+_MAX_WORKING_MESSAGES = 20
 
 
 class WorkingMemory:
@@ -92,3 +100,118 @@ class WorkingMemory:
             self._client.delete(self._key(user_id, thread_id))
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# DB-backed working memory (PostgreSQL)
+# ---------------------------------------------------------------------------
+
+_SQL_INSERT = """
+    INSERT INTO working_messages (user_id, role, content)
+    VALUES (%s, %s, %s)
+"""
+
+_SQL_PRUNE = """
+    DELETE FROM working_messages
+    WHERE user_id = %s
+      AND id NOT IN (
+          SELECT id FROM working_messages
+          WHERE user_id = %s
+          ORDER BY created_at DESC
+          LIMIT %s
+      )
+"""
+
+_SQL_SELECT_RECENT = """
+    SELECT role, content, created_at
+    FROM (
+        SELECT role, content, created_at
+        FROM working_messages
+        WHERE user_id = %s
+        ORDER BY created_at DESC
+        LIMIT %s
+    ) sub
+    ORDER BY created_at ASC
+"""
+
+_SQL_DELETE_USER = """
+    DELETE FROM working_messages
+    WHERE user_id = %s
+"""
+
+
+class DBWorkingMemory:
+    """
+    PostgreSQL-backed working memory scoped by user_id only.
+
+    Stores the most recent messages and returns them in chronological order
+    (oldest to newest) for prompt injection.  Per-user message count is capped
+    at ``max_messages`` (default 20); older messages are pruned on each append.
+
+    Args:
+        conn_factory: A zero-argument callable that returns an open
+                      psycopg3 ``Connection``.  Typically a lambda wrapping
+                      ``get_pg_connection(dsn)``.
+        max_messages: Maximum messages to keep per user (default 20).
+    """
+
+    def __init__(
+        self,
+        conn_factory: Any,
+        max_messages: int = _MAX_WORKING_MESSAGES,
+    ) -> None:
+        self._conn_factory = conn_factory
+        self._max_messages = max_messages
+
+    def append(self, user_id: str, role: str, content: str) -> None:
+        """
+        Insert a message for *user_id* and prune any excess rows.
+
+        Pruning keeps the most recent ``max_messages`` rows; older rows
+        are deleted in the same connection.
+        """
+        conn = self._conn_factory()
+        try:
+            conn.autocommit = False  # type: ignore[attr-defined]
+            with conn.cursor() as cur:  # type: ignore[attr-defined]
+                cur.execute(_SQL_INSERT, (user_id, role, content))
+                cur.execute(_SQL_PRUNE, (user_id, user_id, self._max_messages))
+            conn.commit()  # type: ignore[attr-defined]
+        except Exception:
+            conn.rollback()  # type: ignore[attr-defined]
+            raise
+        finally:
+            conn.close()  # type: ignore[attr-defined]
+
+    def get_recent(self, user_id: str, limit: int = _MAX_WORKING_MESSAGES) -> list[dict[str, Any]]:
+        """
+        Return up to *limit* most recent messages in chronological order.
+
+        Each item is a dict with keys ``role``, ``content``, and ``created_at``.
+        """
+        conn = self._conn_factory()
+        try:
+            with conn.cursor() as cur:  # type: ignore[attr-defined]
+                cur.execute(_SQL_SELECT_RECENT, (user_id, limit))
+                rows = cur.fetchall()
+        finally:
+            conn.close()  # type: ignore[attr-defined]
+
+        return [
+            {"role": row[0], "content": row[1], "created_at": row[2]}
+            for row in rows
+        ]
+
+    def delete(self, user_id: str) -> None:
+        """Delete all working-memory messages for *user_id*."""
+        conn = self._conn_factory()
+        try:
+            conn.autocommit = False  # type: ignore[attr-defined]
+            with conn.cursor() as cur:  # type: ignore[attr-defined]
+                cur.execute(_SQL_DELETE_USER, (user_id,))
+            conn.commit()  # type: ignore[attr-defined]
+        except Exception:
+            conn.rollback()  # type: ignore[attr-defined]
+            raise
+        finally:
+            conn.close()  # type: ignore[attr-defined]

@@ -87,6 +87,17 @@ CREATE TABLE IF NOT EXISTS user_profiles (
 
 CREATE INDEX IF NOT EXISTS idx_user_profiles_user_id
     ON user_profiles (user_id);
+
+CREATE TABLE IF NOT EXISTS working_messages (
+    id         UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id    TEXT        NOT NULL,
+    role       TEXT        NOT NULL,
+    content    TEXT        NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_working_messages_user_created
+    ON working_messages (user_id, created_at DESC);
 """
 
 
@@ -109,7 +120,7 @@ class PostgresConfig:
 # ---------------------------------------------------------------------------
 
 
-def get_pg_connection(dsn: str) -> "psycopg.Connection[Any]":
+def get_pg_connection(dsn: str) -> psycopg.Connection[Any]:
     """
     Open and return a psycopg3 connection.
 
@@ -143,7 +154,7 @@ def _load_migration_sql() -> str:
     return _INLINE_SQL
 
 
-def ensure_pg_schema(conn: "psycopg.Connection[Any]") -> None:
+def ensure_pg_schema(conn: psycopg.Connection[Any]) -> None:
     """
     Idempotently create all tables, indexes and the pgvector extension.
 

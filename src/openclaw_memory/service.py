@@ -33,7 +33,7 @@ from .pg_search import pg_search_keyword, pg_search_vector
 from .query_expansion import extract_keywords
 from .temporal_decay import TemporalDecayConfig, apply_temporal_decay_by_created_at
 from .types import MemorySearchResult
-from .working_memory import WorkingMemory
+from .working_memory import DBWorkingMemory, WorkingMemory
 
 if TYPE_CHECKING:
     import psycopg  # type: ignore[import]
@@ -56,18 +56,19 @@ def _result_dict_to_search_result(d: dict[str, Any]) -> MemorySearchResult:
 
 
 def _working_memory_to_results(
-    messages: list[dict[str, Any]], user_id: str, thread_id: str
+    messages: list[dict[str, Any]], user_id: str, thread_id: str | None = None
 ) -> list[dict[str, Any]]:
     """Convert raw working-memory messages to result dicts compatible with merge pipeline."""
     results: list[dict[str, Any]] = []
+    scope = thread_id if thread_id else "db"
     for i, msg in enumerate(messages):
         content = msg.get("content", "")
         if not content:
             continue
         results.append(
             {
-                "id": f"wm:{user_id}:{thread_id}:{i}",
-                "path": f"working/{user_id}/{thread_id}/{i}",
+                "id": f"wm:{user_id}:{scope}:{i}",
+                "path": f"working/{user_id}/{scope}/{i}",
                 "start_line": i,
                 "end_line": i,
                 "source": "working_memory",
@@ -91,10 +92,15 @@ class MemoryService:
     Unified orchestrator for L1/L2/L3 memory operations.
 
     Args:
-        pg_dsn:             PostgreSQL connection DSN.
-        embedding_provider: Embedding provider implementing EmbeddingProvider protocol.
-        llm_fn:             Optional LLM callable for extraction and re-ranking.
-        redis_url:          Optional Redis URL for L1 working memory.
+        pg_dsn:                   PostgreSQL connection DSN.
+        embedding_provider:       Embedding provider implementing EmbeddingProvider protocol.
+        llm_fn:                   Optional LLM callable for extraction and re-ranking.
+        redis_url:                Optional Redis URL for L1 working memory.
+        working_memory_provider:  Optional DBWorkingMemory instance for DB-backed L1.
+                                  When provided, it takes precedence over Redis for
+                                  record_message() and search() DB working memory.
+                                  If None and pg_dsn is set, a DBWorkingMemory is
+                                  auto-created using pg_dsn.
     """
 
     def __init__(
@@ -103,6 +109,7 @@ class MemoryService:
         embedding_provider: EmbeddingProvider,
         llm_fn: Callable[[str], str] | None = None,
         redis_url: str | None = None,
+        working_memory_provider: DBWorkingMemory | None = None,
     ) -> None:
         self._pg_dsn = pg_dsn
         self._embedding_provider = embedding_provider
@@ -110,17 +117,26 @@ class MemoryService:
         self._working_memory: WorkingMemory | None = (
             WorkingMemory(redis_url) if redis_url else None
         )
+        # DB-backed working memory: use explicit provider, or auto-create from DSN
+        if working_memory_provider is not None:
+            self._db_working_memory: DBWorkingMemory | None = working_memory_provider
+        elif pg_dsn:
+            self._db_working_memory = DBWorkingMemory(
+                conn_factory=lambda: get_pg_connection(pg_dsn)
+            )
+        else:
+            self._db_working_memory = None
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _get_conn(self) -> "psycopg.Connection[Any]":
+    def _get_conn(self) -> psycopg.Connection[Any]:
         return get_pg_connection(self._pg_dsn)
 
     def _store_memory(
         self,
-        conn: "psycopg.Connection[Any]",
+        conn: psycopg.Connection[Any],
         user_id: str,
         memory: ExtractedMemory,
         table: str = "episodic_memories",
@@ -146,7 +162,7 @@ class MemoryService:
 
     def _store_raw_episode(
         self,
-        conn: "psycopg.Connection[Any]",
+        conn: psycopg.Connection[Any],
         user_id: str,
         thread_id: str,
         content: str,
@@ -160,6 +176,27 @@ class MemoryService:
         """
         with conn.cursor() as cur:  # type: ignore[attr-defined]
             cur.execute(sql, (user_id, thread_id, content, embedding_str))
+
+    # ------------------------------------------------------------------
+    # Working memory write path
+    # ------------------------------------------------------------------
+
+    def record_message(self, user_id: str, role: str, content: str) -> None:
+        """
+        Append a single message to DB-backed working memory for *user_id*.
+
+        Requires DB working memory to be configured (auto-created from pg_dsn
+        or injected via working_memory_provider).  No-ops silently if DB
+        working memory is not available.
+
+        Args:
+            user_id: Tenant identifier.
+            role:    Message role (e.g. ``"user"``, ``"assistant"``).
+            content: Message text content.
+        """
+        if self._db_working_memory is None:
+            return
+        self._db_working_memory.append(user_id, role, content)
 
     # ------------------------------------------------------------------
     # Read path
@@ -178,12 +215,13 @@ class MemoryService:
         mmr_config: MMRConfig | None = None,
         vector_weight: float = 0.7,
         text_weight: float = 0.3,
+        working_memory_limit: int = 20,
     ) -> list[MemorySearchResult]:
         """
         Unified search across all memory layers.
 
         Pipeline:
-          1. L1 working memory (Redis, optional)
+          1. L1 working memory (Redis or DB, optional)
           2. L2 episodic + L3 semantic (PostgreSQL)
           3. merge_hybrid_results
           4. temporal decay (L2 only)
@@ -194,13 +232,15 @@ class MemoryService:
             user_id:               Tenant scoping — mandatory.
             query:                 Natural language search query.
             max_results:           Maximum number of results to return.
-            include_working_memory: Whether to prepend L1 (Redis) results.
+            include_working_memory: Whether to prepend L1 (Redis or DB) results.
             enable_llm_rerank:     Whether to apply LLM re-ranking step.
-            thread_id:             Optional thread for working-memory lookup.
+            thread_id:             Optional thread for Redis working-memory lookup.
             temporal_decay_config: Override temporal decay settings.
             mmr_config:            Override MMR settings.
             vector_weight:         Weight for vector scores in hybrid merge.
             text_weight:           Weight for keyword scores in hybrid merge.
+            working_memory_limit:  Max messages to retrieve from DB working memory
+                                   (default 20).
         """
         # --- Query expansion ---
         keywords = extract_keywords(query)
@@ -265,11 +305,21 @@ class MemoryService:
             reranked = llm_rerank(query, reranked, self._llm_fn, top_k=max_results)
 
         # --- Prepend L1 working memory ---
+        # Priority: Redis (thread-scoped) > DB (user-scoped)
         wm_results: list[dict[str, Any]] = []
-        if include_working_memory and self._working_memory is not None and thread_id:
-            messages = self._working_memory.get(user_id, thread_id)
-            if messages:
-                wm_results = _working_memory_to_results(messages, user_id, thread_id)
+        if include_working_memory:
+            if self._working_memory is not None and thread_id:
+                # Redis-backed working memory (thread-scoped)
+                messages = self._working_memory.get(user_id, thread_id)
+                if messages:
+                    wm_results = _working_memory_to_results(messages, user_id, thread_id)
+            elif self._db_working_memory is not None:
+                # DB-backed working memory (user-scoped, no thread_id required)
+                messages = self._db_working_memory.get_recent(
+                    user_id, limit=working_memory_limit
+                )
+                if messages:
+                    wm_results = _working_memory_to_results(messages, user_id)
 
         # Working memory results appear first (highest priority = most recent context)
         combined = wm_results + reranked
