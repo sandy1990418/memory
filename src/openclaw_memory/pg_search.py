@@ -12,13 +12,31 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     import psycopg
 
-_VALID_TABLES = frozenset({"episodic_memories", "semantic_memories"})
+_VALID_TABLES = frozenset({"episodic_memories", "semantic_memories", "canonical_memories"})
 
 
 def _validate_table(table: str) -> str:
     if table not in _VALID_TABLES:
         raise ValueError(f"Unknown table {table!r}. Must be one of {sorted(_VALID_TABLES)}")
     return table
+
+
+def _table_text_column(table: str) -> str:
+    if table == "canonical_memories":
+        return "value"
+    return "content"
+
+
+def _table_extra_where(table: str) -> str:
+    if table == "canonical_memories":
+        return " AND status = 'active'"
+    return ""
+
+
+def _table_path_prefix(table: str) -> str:
+    if table == "canonical_memories":
+        return "canonical"
+    return "episodic"
 
 
 def pg_search_vector(
@@ -55,6 +73,9 @@ def pg_search_vector(
         ) from exc
 
     tbl = _validate_table(table)
+    text_col = _table_text_column(tbl)
+    extra_where = _table_extra_where(tbl)
+    path_prefix = _table_path_prefix(tbl)
     source = tbl.rstrip("s").replace("_memorie", "")  # "episodic" / "semantic"
 
     params: list[Any] = [query_vec, user_id]
@@ -67,12 +88,12 @@ def pg_search_vector(
     sql = f"""
         SELECT
             id::text,
-            content,
+            {text_col},
             created_at,
             memory_type,
             1.0 - (embedding <=> %s::vector) AS cosine_similarity
         FROM {tbl}
-        WHERE user_id = %s{where_extra}
+        WHERE user_id = %s{extra_where}{where_extra}
           AND embedding IS NOT NULL
         ORDER BY embedding <=> %s::vector
         LIMIT %s
@@ -91,7 +112,7 @@ def pg_search_vector(
         results.append(
             {
                 "id": str(row_id),
-                "path": f"episodic/{row_id}",
+                "path": f"{path_prefix}/{row_id}",
                 "start_line": 0,
                 "end_line": 0,
                 "source": memory_type or source,
@@ -137,6 +158,9 @@ def pg_search_keyword(
         ) from exc
 
     tbl = _validate_table(table)
+    text_col = _table_text_column(tbl)
+    extra_where = _table_extra_where(tbl)
+    path_prefix = _table_path_prefix(tbl)
     source = tbl.rstrip("s").replace("_memorie", "")  # "episodic" / "semantic"
 
     params: list[Any] = [query, user_id]
@@ -146,19 +170,34 @@ def pg_search_keyword(
         params.append(source_filter)
     params.append(limit)
 
-    sql = f"""
-        SELECT
-            id::text,
-            content,
-            created_at,
-            memory_type,
-            ts_rank(tsv, plainto_tsquery('english', %s)) AS rank
-        FROM {tbl}
-        WHERE user_id = %s{where_extra}
-          AND tsv @@ plainto_tsquery('english', %s)
-        ORDER BY rank DESC
-        LIMIT %s
-    """
+    if tbl == "canonical_memories":
+        sql = f"""
+            SELECT
+                id::text,
+                {text_col},
+                created_at,
+                memory_type,
+                ts_rank(to_tsvector('english', {text_col}), plainto_tsquery('english', %s)) AS rank
+            FROM {tbl}
+            WHERE user_id = %s{extra_where}{where_extra}
+              AND to_tsvector('english', {text_col}) @@ plainto_tsquery('english', %s)
+            ORDER BY rank DESC
+            LIMIT %s
+        """
+    else:
+        sql = f"""
+            SELECT
+                id::text,
+                {text_col},
+                created_at,
+                memory_type,
+                ts_rank(tsv, plainto_tsquery('english', %s)) AS rank
+            FROM {tbl}
+            WHERE user_id = %s{extra_where}{where_extra}
+              AND tsv @@ plainto_tsquery('english', %s)
+            ORDER BY rank DESC
+            LIMIT %s
+        """
     # plainto_tsquery is referenced twice; insert second copy before LIMIT.
     params.insert(-1, query)
 
@@ -172,7 +211,7 @@ def pg_search_keyword(
         results.append(
             {
                 "id": str(row_id),
-                "path": f"episodic/{row_id}",
+                "path": f"{path_prefix}/{row_id}",
                 "start_line": 0,
                 "end_line": 0,
                 "source": memory_type or source,

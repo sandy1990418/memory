@@ -37,6 +37,10 @@ def _resolve_db_path(workspace: str) -> str:
     from_env = os.environ.get("OPENCLAW_DB_PATH")
     if from_env:
         return from_env
+    # When workspace is explicitly provided (common in tests and isolated runs),
+    # keep the DB under that workspace to avoid cross-environment permission issues.
+    if workspace:
+        return os.path.join(workspace, ".openclaw", "memory", "main.sqlite")
     state_dir = os.environ.get(
         "OPENCLAW_STATE_DIR", os.path.join(os.path.expanduser("~"), ".openclaw")
     )

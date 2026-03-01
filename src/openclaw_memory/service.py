@@ -23,6 +23,7 @@ import json
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+from .answer_contract import AnswerPayload, generate_answer
 from .embeddings import EmbeddingProvider
 from .extraction import ExtractedMemory, extract_memories
 from .hybrid import merge_hybrid_results
@@ -110,6 +111,10 @@ class MemoryService:
         llm_fn: Callable[[str], str] | None = None,
         redis_url: str | None = None,
         working_memory_provider: DBWorkingMemory | None = None,
+        *,
+        enable_structured_distill: bool = False,
+        enable_conflict_resolver: bool = False,
+        enable_answer_contract: bool = False,
     ) -> None:
         self._pg_dsn = pg_dsn
         self._embedding_provider = embedding_provider
@@ -117,6 +122,10 @@ class MemoryService:
         self._working_memory: WorkingMemory | None = (
             WorkingMemory(redis_url) if redis_url else None
         )
+        # Feature flags
+        self._enable_structured_distill = enable_structured_distill
+        self._enable_conflict_resolver = enable_conflict_resolver
+        self._enable_answer_contract = enable_answer_contract
         # DB-backed working memory: use explicit provider, or auto-create from DSN
         if working_memory_provider is not None:
             self._db_working_memory: DBWorkingMemory | None = working_memory_provider
@@ -133,6 +142,15 @@ class MemoryService:
 
     def _get_conn(self) -> psycopg.Connection[Any]:
         return get_pg_connection(self._pg_dsn)
+
+    def _is_structured_distill_enabled(self) -> bool:
+        return bool(getattr(self, "_enable_structured_distill", False))
+
+    def _is_conflict_resolver_enabled(self) -> bool:
+        return bool(getattr(self, "_enable_conflict_resolver", False))
+
+    def _is_answer_contract_enabled(self) -> bool:
+        return bool(getattr(self, "_enable_answer_contract", False))
 
     def _store_memory(
         self,
@@ -159,6 +177,32 @@ class MemoryService:
                     json.dumps(memory.metadata),
                 ),
             )
+
+    def _store_memory_with_resolver(
+        self,
+        conn: psycopg.Connection[Any],
+        user_id: str,
+        memory: ExtractedMemory,
+    ) -> None:
+        """
+        Store a memory using the conflict resolver pipeline (canonical_memories table).
+
+        Falls back to direct storage into episodic/semantic tables if resolver
+        cannot be used.
+        """
+        try:
+            from .conflict_resolver import apply_resolution, resolve_conflict  # noqa: PLC0415
+
+            resolution = resolve_conflict(
+                conn, user_id, memory, self._embedding_provider
+            )
+            value_for_embedding = memory.value or memory.content
+            embedding = self._embedding_provider.embed_query(value_for_embedding)
+            apply_resolution(conn, user_id, resolution, embedding=embedding)
+        except Exception:
+            # Resolver unavailable or schema not ready; keep write path functional.
+            table = "episodic_memories" if memory.memory_type == "event" else "semantic_memories"
+            self._store_memory(conn, user_id, memory, table=table)
 
     def _store_raw_episode(
         self,
@@ -250,6 +294,9 @@ class MemoryService:
         query_vec = self._embedding_provider.embed_query(query)
 
         # --- PostgreSQL search (L2 + L3) ---
+        canonical_vec: list[dict[str, Any]] = []
+        canonical_kw: list[dict[str, Any]] = []
+
         conn = self._get_conn()
         try:
             episodic_vec = pg_search_vector(
@@ -264,12 +311,19 @@ class MemoryService:
             semantic_kw = pg_search_keyword(
                 conn, user_id, keyword_query, limit=20, table="semantic_memories"
             )
+            if self._is_conflict_resolver_enabled():
+                canonical_vec = pg_search_vector(
+                    conn, user_id, query_vec, limit=20, table="canonical_memories"
+                )
+                canonical_kw = pg_search_keyword(
+                    conn, user_id, keyword_query, limit=20, table="canonical_memories"
+                )
         finally:
             conn.close()
 
         # Combine all vector/keyword results
-        all_vector = episodic_vec + semantic_vec
-        all_keyword = episodic_kw + semantic_kw
+        all_vector = episodic_vec + semantic_vec + canonical_vec
+        all_keyword = episodic_kw + semantic_kw + canonical_kw
 
         # --- Hybrid merge ---
         merged = merge_hybrid_results(
@@ -351,19 +405,32 @@ class MemoryService:
             return {"inserted": 0, "skipped": 0, "error": "llm_fn not configured"}
 
         memories = extract_memories(conversation, self._llm_fn)
+        if not self._is_structured_distill_enabled():
+            for mem in memories:
+                mem.memory_key = ""
+                mem.value = mem.content
+                mem.event_time = None
+                mem.source_refs = []
 
         inserted = 0
+        use_resolver = (
+            self._is_structured_distill_enabled()
+            and self._is_conflict_resolver_enabled()
+        )
         conn = self._get_conn()
         try:
             conn.autocommit = False
             for mem in memories:
-                # Classify: "fact"/"preference"/"decision" → semantic; "event" → episodic
-                table = (
-                    "episodic_memories"
-                    if mem.memory_type == "event"
-                    else "semantic_memories"
-                )
-                self._store_memory(conn, user_id, mem, table=table)
+                if use_resolver:
+                    self._store_memory_with_resolver(conn, user_id, mem)
+                else:
+                    # Classify: "fact"/"preference"/"decision" → semantic; "event" → episodic
+                    table = (
+                        "episodic_memories"
+                        if mem.memory_type == "event"
+                        else "semantic_memories"
+                    )
+                    self._store_memory(conn, user_id, mem, table=table)
                 inserted += 1
             conn.commit()
         except Exception:
@@ -431,18 +498,31 @@ class MemoryService:
             return {"inserted": 0, "error": "llm_fn not configured"}
 
         memories = extract_memories(conversation, self._llm_fn)
+        if not self._is_structured_distill_enabled():
+            for mem in memories:
+                mem.memory_key = ""
+                mem.value = mem.content
+                mem.event_time = None
+                mem.source_refs = []
 
         inserted = 0
+        use_resolver = (
+            self._is_structured_distill_enabled()
+            and self._is_conflict_resolver_enabled()
+        )
         conn = self._get_conn()
         try:
             conn.autocommit = False
             for mem in memories:
-                table = (
-                    "episodic_memories"
-                    if mem.memory_type == "event"
-                    else "semantic_memories"
-                )
-                self._store_memory(conn, user_id, mem, table=table)
+                if use_resolver:
+                    self._store_memory_with_resolver(conn, user_id, mem)
+                else:
+                    table = (
+                        "episodic_memories"
+                        if mem.memory_type == "event"
+                        else "semantic_memories"
+                    )
+                    self._store_memory(conn, user_id, mem, table=table)
                 inserted += 1
             conn.commit()
         except Exception:
@@ -452,6 +532,70 @@ class MemoryService:
             conn.close()
 
         return {"inserted": inserted}
+
+    # ------------------------------------------------------------------
+    # Answer (schema-constrained LLM response)
+    # ------------------------------------------------------------------
+
+    def answer(
+        self,
+        user_id: str,
+        query: str,
+        **search_kwargs: Any,
+    ) -> AnswerPayload:
+        """
+        Search → evidence package → LLM answer (schema constrained) → validation.
+
+        Args:
+            user_id:        Tenant identifier.
+            query:          The user's natural-language question.
+            **search_kwargs: Forwarded to self.search() (e.g. max_results, thread_id).
+
+        Returns:
+            AnswerPayload — abstains if no LLM is configured or search returns nothing.
+        """
+        results = self.search(user_id, query, **search_kwargs)
+
+        # Legacy answer mode: return top snippet without schema-constrained generation.
+        if not self._is_answer_contract_enabled():
+            if not results:
+                return AnswerPayload(
+                    answer="",
+                    evidence=[],
+                    confidence=0.0,
+                    abstain=True,
+                    abstain_reason="No relevant memory found",
+                )
+            top = results[0]
+            return AnswerPayload(
+                answer=top.snippet,
+                evidence=[],
+                confidence=max(0.0, min(1.0, top.score)),
+                abstain=False,
+                abstain_reason="",
+            )
+
+        if self._llm_fn is None:
+            return AnswerPayload(
+                answer="",
+                evidence=[],
+                confidence=0.0,
+                abstain=True,
+                abstain_reason="LLM not configured",
+            )
+
+        # Convert MemorySearchResult objects to evidence chunk dicts
+        evidence_chunks = [
+            {
+                "path": r.path,
+                "id": r.path,
+                "snippet": r.snippet,
+                "score": r.score,
+            }
+            for r in results
+        ]
+
+        return generate_answer(query, evidence_chunks, self._llm_fn)
 
     # ------------------------------------------------------------------
     # Profile CRUD

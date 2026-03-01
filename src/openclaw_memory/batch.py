@@ -72,7 +72,18 @@ class MemoryBatchProcessor:
         if self.llm_fn is None:
             raise RuntimeError("llm_fn must be set before flushing")
 
+        # Build source refs from message timestamps or positional indices
+        source_refs: list[str] = []
+        for idx, msg in enumerate(messages):
+            ts = msg.get("timestamp") or msg.get("ts")
+            source_refs.append(str(ts) if ts is not None else str(idx))
+
         memories = extract_memories(messages, self.llm_fn)
+
+        # Propagate source_refs into memories that don't already have them
+        for mem in memories:
+            if not mem.source_refs:
+                mem.source_refs = list(source_refs)
 
         if memories and self.conn is not None and self.embedding_provider is not None:
             for mem in memories:

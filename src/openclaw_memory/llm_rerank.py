@@ -15,7 +15,8 @@ from typing import Any
 _RERANK_PROMPT = """\
 You are a memory relevance scoring assistant.
 
-Given a user query and a list of memory candidates, score each memory on how relevant it is to the query.
+Given a user query and a list of memory candidates, score each memory based on
+how relevant it is to the query.
 
 Query: {query}
 

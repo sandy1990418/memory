@@ -98,6 +98,31 @@ CREATE TABLE IF NOT EXISTS working_messages (
 
 CREATE INDEX IF NOT EXISTS idx_working_messages_user_created
     ON working_messages (user_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS canonical_memories (
+    id                    UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id               TEXT        NOT NULL,
+    memory_key            TEXT        NOT NULL,
+    value                 TEXT        NOT NULL,
+    memory_type           TEXT        NOT NULL,
+    confidence            FLOAT       NOT NULL DEFAULT 0.8,
+    event_time            TIMESTAMPTZ,
+    status                TEXT        NOT NULL DEFAULT 'active',
+    supersedes_memory_id  UUID        REFERENCES canonical_memories(id),
+    embedding             vector(1536),
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    metadata              JSONB       NOT NULL DEFAULT '{}'
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_canonical_active_key
+    ON canonical_memories (user_id, memory_key) WHERE status = 'active';
+
+CREATE INDEX IF NOT EXISTS idx_canonical_user_id
+    ON canonical_memories (user_id);
+
+CREATE INDEX IF NOT EXISTS idx_canonical_embedding_hnsw
+    ON canonical_memories USING hnsw (embedding vector_cosine_ops);
 """
 
 

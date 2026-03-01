@@ -15,7 +15,6 @@ from typing import Any, Protocol, runtime_checkable
 from .embeddings import EmbeddingProvider
 from .extraction import ExtractedMemory
 
-
 # ---------------------------------------------------------------------------
 # Abstract DB protocol — callers can pass psycopg2/3, SQLite, or mocks
 # ---------------------------------------------------------------------------

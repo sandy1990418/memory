@@ -198,13 +198,13 @@ def index_file_entry_if_changed(
 
     now = int(time.time() * 1000)
 
-    for chunk in chunks:
-        chunk_id = hash_chunk_id(entry.path, chunk.start_line, chunk.end_line, chunk.hash)
-
-        # Embed
-        embedding: list[float] = []
-        if provider is not None:
-            # Try cache
+    # Embed (batch where possible, with cache)
+    embeddings: list[list[float] | None] = [None] * len(chunks)
+    if provider is not None:
+        to_embed_texts: list[str] = []
+        to_embed_indices: list[int] = []
+        # 1) Try cache for each chunk
+        for i, chunk in enumerate(chunks):
             cached: list[float] | None = None
             if cache_enabled:
                 cached = _get_cached_embedding(
@@ -215,22 +215,55 @@ def index_file_entry_if_changed(
                     text_hash=chunk.hash,
                 )
             if cached is not None:
-                embedding = cached
+                embeddings[i] = cached
             else:
+                to_embed_texts.append(chunk.text)
+                to_embed_indices.append(i)
+
+        # 2) Batch-embed missing chunks
+        if to_embed_texts:
+            batch_size = 32
+            for start in range(0, len(to_embed_texts), batch_size):
+                batch_texts = to_embed_texts[start : start + batch_size]
+                batch_indices = to_embed_indices[start : start + batch_size]
                 try:
-                    embedding = provider.embed_query(chunk.text)
-                    if cache_enabled and embedding:
+                    batch_embeddings = provider.embed_batch(batch_texts)
+                except Exception:
+                    # Fallback to per-item embedding if batch fails
+                    batch_embeddings = []
+                    for text in batch_texts:
+                        try:
+                            batch_embeddings.append(provider.embed_query(text))
+                        except Exception:
+                            batch_embeddings.append([])
+
+                # Guard against provider returning unexpected length
+                if len(batch_embeddings) != len(batch_texts):
+                    # Fallback to per-item embedding to realign
+                    batch_embeddings = []
+                    for text in batch_texts:
+                        try:
+                            batch_embeddings.append(provider.embed_query(text))
+                        except Exception:
+                            batch_embeddings.append([])
+
+                for idx, emb in zip(batch_indices, batch_embeddings):
+                    embeddings[idx] = emb
+                    if cache_enabled and emb:
+                        chunk = chunks[idx]
                         _put_cached_embedding(
                             db,
                             provider=provider_id,
                             model=model,
                             provider_key=provider_key,
                             text_hash=chunk.hash,
-                            embedding=embedding,
+                            embedding=emb,
                         )
-                except Exception:
-                    embedding = []
 
+    # 3) Upsert chunks
+    for i, chunk in enumerate(chunks):
+        chunk_id = hash_chunk_id(entry.path, chunk.start_line, chunk.end_line, chunk.hash)
+        embedding = embeddings[i] if embeddings[i] is not None else []
         embedding_json = json.dumps(embedding)
         _upsert_chunk(
             db,
