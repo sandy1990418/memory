@@ -39,6 +39,19 @@ def _table_path_prefix(table: str) -> str:
     return "episodic"
 
 
+def _path_from_metadata(
+    metadata: Any,
+    *,
+    default_path: str,
+) -> str:
+    """Use metadata.source_path when available; otherwise keep legacy path format."""
+    if isinstance(metadata, dict):
+        source_path = metadata.get("source_path")
+        if isinstance(source_path, str) and source_path.strip():
+            return source_path.strip().replace("\\", "/")
+    return default_path
+
+
 def pg_search_vector(
     conn: psycopg.Connection[Any],
     user_id: str,
@@ -91,7 +104,8 @@ def pg_search_vector(
             {text_col},
             created_at,
             memory_type,
-            1.0 - (embedding <=> %s::vector) AS cosine_similarity
+            1.0 - (embedding <=> %s::vector) AS cosine_similarity,
+            metadata
         FROM {tbl}
         WHERE user_id = %s{extra_where}{where_extra}
           AND embedding IS NOT NULL
@@ -108,11 +122,14 @@ def pg_search_vector(
 
     results: list[dict[str, Any]] = []
     for row in rows:
-        row_id, content, created_at, memory_type, cosine_sim = row
+        row_id, content, created_at, memory_type, cosine_sim, metadata = (
+            row if len(row) >= 6 else (*row, {})
+        )
+        default_path = f"{path_prefix}/{row_id}"
         results.append(
             {
                 "id": str(row_id),
-                "path": f"{path_prefix}/{row_id}",
+                "path": _path_from_metadata(metadata, default_path=default_path),
                 "start_line": 0,
                 "end_line": 0,
                 "source": memory_type or source,
@@ -177,7 +194,8 @@ def pg_search_keyword(
                 {text_col},
                 created_at,
                 memory_type,
-                ts_rank(to_tsvector('english', {text_col}), plainto_tsquery('english', %s)) AS rank
+                ts_rank(to_tsvector('english', {text_col}), plainto_tsquery('english', %s)) AS rank,
+                metadata
             FROM {tbl}
             WHERE user_id = %s{extra_where}{where_extra}
               AND to_tsvector('english', {text_col}) @@ plainto_tsquery('english', %s)
@@ -191,7 +209,8 @@ def pg_search_keyword(
                 {text_col},
                 created_at,
                 memory_type,
-                ts_rank(tsv, plainto_tsquery('english', %s)) AS rank
+                ts_rank(tsv, plainto_tsquery('english', %s)) AS rank,
+                metadata
             FROM {tbl}
             WHERE user_id = %s{extra_where}{where_extra}
               AND tsv @@ plainto_tsquery('english', %s)
@@ -207,11 +226,14 @@ def pg_search_keyword(
 
     results: list[dict[str, Any]] = []
     for row in rows:
-        row_id, content, created_at, memory_type, rank = row
+        row_id, content, created_at, memory_type, rank, metadata = (
+            row if len(row) >= 6 else (*row, {})
+        )
+        default_path = f"{path_prefix}/{row_id}"
         results.append(
             {
                 "id": str(row_id),
-                "path": f"{path_prefix}/{row_id}",
+                "path": _path_from_metadata(metadata, default_path=default_path),
                 "start_line": 0,
                 "end_line": 0,
                 "source": memory_type or source,
