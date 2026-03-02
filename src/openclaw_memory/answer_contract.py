@@ -58,6 +58,10 @@ the provided evidence chunks.
 - If evidence conflicts, prefer the most likely latest/updated fact:
   higher score, clearer direct statement, and newer-looking source id/path.
 - For counting or temporal questions, combine multiple evidence snippets when needed.
+- For questions about "latest/current/updated/changed", prioritize explicit dates/times
+  and the newest supported statement.
+- For recommendation/personalized questions, explicitly anchor the answer to user-specific
+  preferences found in evidence (avoid generic advice).
 - Set "abstain": true ONLY when no evidence supports any concrete answer.
 - Return strict JSON matching this schema (no markdown fences, no extra keys):
 
@@ -90,6 +94,8 @@ provided evidence chunks and produce the best-supported answer.
 - Do NOT abstain if at least one evidence chunk supports a concrete answer.
 - If evidence conflicts, choose the most likely latest/updated fact and cite it.
 - For counting/temporal questions, aggregate across relevant chunks.
+- For latest/current/updated questions, select the most recent supported fact.
+- For personalized recommendation questions, use concrete user preferences from evidence.
 - Only set "abstain": true when there is truly no supporting evidence.
 - Return strict JSON matching this schema (no markdown fences, no extra keys):
 

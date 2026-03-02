@@ -1,0 +1,21 @@
+version: "3.9"
+services:
+  pgvector:
+    image: pgvector/pgvector:pg16
+    container_name: openclaw-pgvector
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_USER: memuser
+      POSTGRES_PASSWORD: mempass
+      POSTGRES_DB: memory
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U memuser -d memory"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+    volumes:
+      - openclaw_pgdata:/var/lib/postgresql/data
+
+volumes:
+  openclaw_pgdata:

@@ -222,13 +222,18 @@ pip install redis                # 可選，L1 工作記憶
 ### 2. 啟動 PostgreSQL + pgvector
 
 ```bash
-docker run -d --name pgvector \
-  -p 5433:5432 \
-  -e POSTGRES_USER=memuser \
-  -e POSTGRES_PASSWORD=mempass \
-  -e POSTGRES_DB=memory \
-  pgvector/pgvector:pg16
+# 推薦：用專案內建 compose + helper script
+bash scripts/pgvector_local.sh start
+bash scripts/pgvector_local.sh init
+export OPENCLAW_PG_DSN="postgresql://memuser:mempass@localhost:5433/memory"
 ```
+
+常用管理指令：
+
+- `bash scripts/pgvector_local.sh status`
+- `bash scripts/pgvector_local.sh logs`
+- `bash scripts/pgvector_local.sh stop`（保留資料）
+- `bash scripts/pgvector_local.sh reset`（刪除資料）
 
 ### 3. 建立 Schema
 
@@ -240,12 +245,14 @@ ensure_pg_schema(conn)  # 幂等，可以重複執行
 conn.close()
 ```
 
-這會建立三張表：
+這會建立主要記憶表（含 resolver queue）：
 
 | 表 | 索引 | 用途 |
 |---|---|---|
 | `episodic_memories` | B-tree(user_id), HNSW(embedding), GIN(tsvector) | L2 情節記憶 |
 | `semantic_memories` | 同上 | L3 語意記憶 |
+| `canonical_memories` | active key unique, HNSW(embedding) | resolver 後的 canonical 記憶 |
+| `memory_update_queue` | (status, available_at), (user_id, status) | offline resolver 更新佇列 |
 | `user_profiles` | PK(user_id) | 使用者 profile（JSONB） |
 
 ### 4. 準備 LLM 函式
@@ -510,6 +517,163 @@ results = memory.search(
 | 舊的記憶排太前面 | 開啟 temporal decay 並降低 `half_life_days` |
 | 使用者用精確術語搜尋 | 提高 `text_weight` |
 
+### Three-Layer Memory Pipeline (Structured Distillation, Conflict Resolution, Answer Contract)
+
+openclaw-memory supports an optional three-layer write/read pipeline that adds structured intelligence on top of the basic extract-and-store flow. Each layer is independently controlled by a config flag and degrades gracefully if the underlying LLM or parser fails.
+
+#### Pipeline Overview
+
+```
+Ingest conversation
+       │
+       ▼
+  [Layer 1] Structured Distillation (enable_structured_distill)
+       │   LLM extracts typed memory facts with confidence scores.
+       │   Falls back to raw text extraction on parse failure.
+       │
+       ▼
+  [Layer 2] Conflict Resolver (enable_conflict_resolver)
+       │   Detects contradictions between new and existing memories.
+       │   Resolves conflicts by updating or superseding stale records.
+       │   Falls back to simple upsert on LLM/parser failure.
+       │
+       ▼
+  [Layer 3] Answer Contract (enable_answer_contract)
+           Wraps retrieval results with an evidence contract —
+           each claim in the answer is tied back to a source chunk.
+           Falls back to plain retrieval results on failure.
+```
+
+#### Config Flags
+
+| Flag | Type | Default | Effect |
+|---|---|---|---|
+| `enable_structured_distill` | `bool` | `False` | Enable Layer 1: LLM-based structured extraction of typed memory facts |
+| `enable_conflict_resolver` | `bool` | `False` | Enable Layer 2: detect and resolve contradictions with existing memories |
+| `enable_answer_contract` | `bool` | `False` | Enable Layer 3: evidence-backed answer contract on retrieval results |
+
+Pass these flags via `MemoryService` constructor or the config overrides dict:
+
+```python
+from openclaw_memory.service import MemoryService
+
+memory_service = MemoryService(
+    pg_dsn="postgresql://memuser:mempass@localhost:5433/memory",
+    embedding_provider=embedding,
+    llm_fn=llm_fn,
+    enable_structured_distill=True,
+    enable_conflict_resolver=True,
+    enable_answer_contract=True,
+)
+```
+
+Or via `resolve_memory_search_config` overrides in benchmark scripts:
+
+```python
+overrides = {
+    "enable_structured_distill": True,
+    "enable_conflict_resolver": True,
+    "enable_answer_contract": True,
+}
+```
+
+#### Layer 1: Structured Distillation
+
+When `enable_structured_distill=True`, the extraction step calls an LLM with a structured prompt that returns typed memory facts:
+
+```json
+[
+  {"content": "User prefers dark mode", "memory_type": "preference", "confidence": 0.95},
+  {"content": "User deployed v2.1 in March 2024", "memory_type": "event", "confidence": 0.8}
+]
+```
+
+Each fact is assigned a `memory_type` that controls routing to `episodic_memories` (events) or `semantic_memories` (preferences/facts/decisions). Confidence scores below a threshold (default 0.5) are dropped.
+
+**Fallback behavior**: If the LLM returns unparseable JSON or times out, the system falls back to the basic extraction path (raw text chunking), ensuring memories are always stored even when the structured distillation fails.
+
+#### Layer 2: Conflict Resolver
+
+When `enable_conflict_resolver=True`, before inserting new memories the system:
+
+1. Searches existing memories for semantically similar content (cosine similarity > 0.85)
+2. Passes both old and new memory to an LLM conflict-detection prompt
+3. If a contradiction is detected, marks the old memory as superseded and stores the new one
+
+Example: if the user previously said "I use VSCode" and now says "I switched to Neovim", the resolver will update the stored preference rather than creating a duplicate.
+
+**Fallback behavior**: If conflict resolution fails (LLM error, parser error, or database timeout), the system falls back to the deduplication logic: update if similarity > threshold, insert otherwise.
+
+#### Layer 3: Answer Contract
+
+When `enable_answer_contract=True`, retrieval results are augmented with an evidence contract — each retrieved chunk is annotated with its support for the final answer:
+
+```python
+memories = memory_service.search(
+    user_id="u1",
+    query="What editor does the user prefer?",
+    enable_answer_contract=True,
+)
+# Each result in memories now includes:
+# result.evidence_supported  -> True/False (heuristic: retrieval hit + non-empty)
+# result.evidence_source     -> source chunk path
+```
+
+This layer is used by the benchmark to compute `evidence_supported_rate`, `unsupported_claim_rate`, and `abstention_precision`.
+
+**Fallback behavior**: If the answer contract computation fails, the system returns plain retrieval results without evidence annotations. The `evidence_*` fields default to `None` in the output JSON.
+
+#### Enabling Layers Selectively
+
+You can enable any combination of layers. Typical configurations:
+
+| Use case | Recommended flags |
+|---|---|
+| Production (balanced cost/quality) | `enable_structured_distill=True` |
+| High-accuracy recall + dedup | `enable_structured_distill=True, enable_conflict_resolver=True` |
+| Full pipeline with evidence | All three enabled |
+| Benchmark evaluation only | `enable_answer_contract=True` (no write-time overhead) |
+
+#### LightMem-Style Speed/Token Optimizations
+
+`MemoryService` now supports a LightMem-inspired write-path optimization profile:
+
+```python
+memory_service = MemoryService(
+    pg_dsn=PG_DSN,
+    embedding_provider=embedding,
+    llm_fn=llm_fn,
+    enable_structured_distill=True,
+    enable_conflict_resolver=True,
+    enable_lightmem=True,            # turn on the profile
+    resolver_update_mode="offline",  # sleep-time canonical consolidation
+    save_session_mode="summary",     # store compact session text instead of full raw log
+)
+```
+
+New constructor knobs:
+
+| Flag | Type | Default | Effect |
+|---|---|---|---|
+| `enable_lightmem` | `bool` | `False` | Enables recommended defaults for fast/low-token write path |
+| `pre_compress` | `bool \| None` | `None` | Pre-compresses long turns before extraction prompt build |
+| `messages_use` | `str \| None` | `None` | Role filter (`\"all\"` or `\"user_only\"`) before extraction |
+| `topic_segment` | `bool \| None` | `None` | Topic-based segmentation for long conversations |
+| `max_distill_tokens` | `int` | `2200` | Hard token budget for extraction input |
+| `topic_token_threshold` | `int` | `600` | Segment split threshold (estimated tokens) |
+| `distill_min_confidence` | `float` | `0.0` | Drop extracted memories below this confidence |
+| `resolver_update_mode` | `str` | `\"sync\"` | `\"sync\"` or `\"offline\"` conflict resolver execution |
+| `save_session_mode` | `str` | `\"raw\"` | `\"raw\"` or `\"summary\"` session archival strategy |
+| `session_summary_chars` | `int` | `1800` | Character cap when `save_session_mode=\"summary\"` |
+
+When `resolver_update_mode=\"offline\"`, writes enqueue resolver jobs into
+`memory_update_queue` and return quickly. Run a background cycle:
+
+```python
+stats = memory_service.drain_update_queue(limit=200)
+print(stats)  # {"claimed": ..., "processed": ..., "retried": ..., "failed": ...}
+```
+
 ### Batch Processing（高吞吐量場景）
 
 如果你的 chatbox 同時服務大量使用者，可以用 batch processor 緩衝 + 批次寫入：
@@ -519,10 +683,14 @@ from openclaw_memory.batch import MemoryBatchProcessor
 
 processor = MemoryBatchProcessor(
     buffer_size=10,              # 累積 10 筆自動 flush
+    token_buffer_threshold=1200, # 或累積 token 達門檻時自動 flush
     llm_fn=llm_fn,
     conn=pg_connection,
     embedding_provider=embedding,
     similarity_threshold=0.85,   # 去重閾值
+    distill_pre_compress=True,   # LightMem 風格前置壓縮
+    distill_messages_use="user_only",
+    distill_topic_segment=True,
 )
 
 # 收到對話就丟進去
@@ -611,3 +779,482 @@ docker compose -f docker-compose.test.yml down -v
 | `working_memory.py` | Redis L1 | 不用，service 內部管理 |
 | `dedup.py` | 去重 | 不用，batch processor 內部呼叫 |
 | `batch.py` | 批次處理 | 高吞吐量才需要，見進階調參 |
+
+
+---
+
+## DB 工作記憶（無 Redis 環境）
+
+當你的環境**沒有 Redis**，或你不想管理 Redis，系統會自動使用 PostgreSQL 作為 L1 工作記憶。這個功能叫做 **DB Working Memory**（`DBWorkingMemory`）。
+
+### 特性說明
+
+| 特性 | 說明 |
+|---|---|
+| 儲存位置 | PostgreSQL `working_messages` 表 |
+| 作用域 | 僅 `user_id`（**無** `thread_id` 分隔） |
+| 預設上限 | **N=20** 條最近訊息（可透過 `working_memory_limit` 覆寫） |
+| 自動啟用 | 只要有 `pg_dsn`，不需要額外設定 |
+| 排序 | 舊到新（oldest-first），方便直接塞入 LLM prompt |
+
+> **注意**：DB 工作記憶以 `user_id` 為唯一維度，**不支援** `thread_id` 隔離。若需要 thread 層級的隔離，請使用 Redis 工作記憶。
+
+### 自動建立
+
+只要你在初始化 `MemoryService` 時傳入 `pg_dsn`，系統就會**自動建立** `DBWorkingMemory`，不需要傳 `redis_url`：
+
+```python
+from openclaw_memory.service import MemoryService
+from openclaw_memory.embeddings import create_embedding_provider
+
+memory_service = MemoryService(
+    pg_dsn="postgresql://memuser:mempass@localhost:5433/memory",
+    embedding_provider=create_embedding_provider(provider="openai"),
+    llm_fn=llm_fn,
+    # redis_url 不傳 → 自動使用 DB 工作記憶
+)
+```
+
+### 寫入：record_message()
+
+每當使用者或助手說了一句話，呼叫 `record_message()` 把它存進 DB 工作記憶：
+
+```python
+# 使用者說話
+memory_service.record_message(
+    user_id="user-123",
+    role="user",
+    content="我想用 Python 寫一個爬蟲",
+)
+
+# 助手回覆
+memory_service.record_message(
+    user_id="user-123",
+    role="assistant",
+    content="好的，我可以幫你寫一個用 requests + BeautifulSoup 的爬蟲",
+)
+```
+
+- `role` 通常是 `"user"` 或 `"assistant"`，也可以是任意字串
+- 每次 append 後，系統自動保留最近 20 條，舊的自動刪除
+- 若 DB 工作記憶未初始化，此方法**靜默 no-op**（不會拋例外）
+
+### 搜尋時自動注入工作記憶
+
+呼叫 `search()` 時，系統自動把最近 N=20 條訊息**前置**在搜尋結果最前面（score 固定為 1.0，永遠排最前）：
+
+```python
+memories = memory_service.search(
+    user_id="user-123",
+    query="爬蟲要用什麼函式庫？",
+    max_results=5,
+    # include_working_memory=True  (預設開啟)
+    # working_memory_limit=20      (預設 20，可覆寫)
+)
+```
+
+限制取用的工作記憶條數：
+
+```python
+memories = memory_service.search(
+    user_id="user-123",
+    query="...",
+    working_memory_limit=5,   # 只取最近 5 條
+)
+```
+
+完全跳過工作記憶：
+
+```python
+memories = memory_service.search(
+    user_id="user-123",
+    query="...",
+    include_working_memory=False,
+)
+```
+
+### Redis 與 DB 的優先順序
+
+| 條件 | 使用的工作記憶 |
+|---|---|
+| 傳了 `redis_url` + 傳了 `thread_id` | Redis（thread 隔離） |
+| 沒有 Redis，有 `pg_dsn` | DB 工作記憶（user_id 隔離，N=20） |
+| 兩者都沒有 | 無工作記憶（僅 L2/L3） |
+
+### 整合範例
+
+```python
+@app.post("/chat")
+async def chat(request: Request):
+    body = await request.json()
+    user_id = body["user_id"]
+    user_msg = body["message"]
+
+    # 1. 把使用者訊息寫入 DB 工作記憶
+    memory_service.record_message(user_id, "user", user_msg)
+
+    # 2. 搜尋記憶（DB 工作記憶自動前置，最多 20 條）
+    memories = memory_service.search(user_id=user_id, query=user_msg)
+    mem_text = "\n".join(f"- {m.snippet}" for m in memories)
+
+    # 3. 呼叫 LLM
+    resp = oai.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": f"相關記憶：\n{mem_text}"},
+            {"role": "user", "content": user_msg},
+        ],
+    )
+    assistant_msg = resp.choices[0].message.content
+
+    # 4. 把助手回覆也存入工作記憶
+    memory_service.record_message(user_id, "assistant", assistant_msg)
+
+    return {"reply": assistant_msg}
+```
+
+---
+
+## Benchmark Sweep（評測與調參）
+
+`tests/benchmark/run_sweep.py` 是內建的 benchmark 執行器，用來比較不同參數組合對搜尋品質（MRR、Recall@5、nDCG@5）的影響。指標定義參考 `docs/benchmark-research.md` §3.1。
+
+### 快速執行
+
+```bash
+# 執行所有 sweep（weights + mmr + decay）
+python tests/benchmark/run_sweep.py
+
+# 只執行特定 sweep 維度
+python tests/benchmark/run_sweep.py --sweep weights
+python tests/benchmark/run_sweep.py --sweep mmr
+python tests/benchmark/run_sweep.py --sweep decay
+
+# 同時執行多個維度
+python tests/benchmark/run_sweep.py --sweep weights mmr
+```
+
+### Sweep 類型
+
+| Sweep 類型 | 調整的參數 | 掃描範圍 |
+|---|---|---|
+| `weights` | `vector_weight` / `text_weight` | vw ∈ {0.3, 0.4, ..., 0.9}，tw = 1 - vw |
+| `mmr` | `mmr_lambda` | λ ∈ {0.3, 0.5, 0.7, 0.9, 1.0} |
+| `decay` | `half_life_days` | disabled, 7, 14, 30, 60, 90 天 |
+| `all` | 三者全跑 | — |
+
+### 結果輸出
+
+Sweep 完成後輸出摘要表格（stdout）和可選 JSON 報告：
+
+```bash
+# 輸出到 JSON 檔案
+python tests/benchmark/run_sweep.py --output sweep_results.json
+```
+
+JSON 格式範例：
+
+```json
+{
+  "sweep": ["all"],
+  "mode": "golden",
+  "queries_count": 12,
+  "results": [
+    {
+      "label": "hybrid vw=0.7 tw=0.3",
+      "sweep_type": "weights",
+      "params": {"vector_weight": 0.7, "text_weight": 0.3},
+      "aggregate": {"mrr": 0.875, "recall@5": 0.875, "ndcg@5": 0.891},
+      "elapsed_s": 1.2
+    }
+  ]
+}
+```
+
+### 執行個別 benchmark runner
+
+```bash
+# Golden corpus benchmark（mock embeddings，不需要 API key）
+python tests/benchmark/run_sweep.py --run-golden
+
+# LongMemEval benchmark（最多 50 筆）
+python tests/benchmark/run_sweep.py --run-benchmark --benchmark-limit 50
+
+# 真實 embedding benchmark（需要 OPENAI_API_KEY）
+python tests/benchmark/run_sweep.py --run-real-embedding
+
+# LoCoMo benchmark（需要先下載 locomo10.json）
+python tests/benchmark/run_locomo_benchmark.py --limit 60
+
+# LongMemEval QA（端到端：檢索 + 回答，需 OPENAI_API_KEY）
+# 預設使用官方 LongMemEval judge（gpt-4o-mini），回答模型預設 gpt-5-mini
+python tests/benchmark/run_longmemeval_qa.py --limit 48 --balanced
+
+# 使用快取（預設會把每個 instance 的 DB 存在 tests/benchmark/.cache/）
+# 若要關閉快取或強制重建：
+python tests/benchmark/run_longmemeval_qa.py --limit 48 --balanced --no-cache
+python tests/benchmark/run_longmemeval_qa.py --limit 48 --balanced --force-reindex
+
+# LongMemEval QA baseline 對照（fts + mock + openai）
+python tests/benchmark/run_longmemeval_qa.py --limit 48 --balanced --provider all
+
+# 產生 QA 後直接更新報告
+python tests/benchmark/run_longmemeval_qa.py --limit 48 --balanced --update-report
+
+# 使用官方 LongMemEval judge（對齊官方評測）
+python tests/benchmark/run_longmemeval_qa.py --limit 48 --balanced --judge longmemeval --judge-model gpt-4o-mini
+
+# 建議：拉高 QA 證據覆蓋（多 session / temporal 題型）
+python tests/benchmark/run_longmemeval_qa.py \
+  --limit 48 --balanced \
+  --search-k 30 \
+  --answer-top-k 10 \
+  --context-lines 60 \
+  --diversify-paths
+
+# 使用 MemoryService pipeline（PostgreSQL；測 service read path）
+python tests/benchmark/run_longmemeval_qa.py \
+  --pipeline service \
+  --pg-dsn "$OPENCLAW_PG_DSN" \
+  --provider openai \
+  --config hybrid \
+  --limit 48 --balanced
+
+# 使用完整三層 write path（distill + resolver + answer）
+python tests/benchmark/run_longmemeval_qa.py \
+  --pipeline service \
+  --service-write-mode distill \
+  --distill-batch-sessions 8 \
+  --service-lightmem \
+  --service-resolver-mode offline \
+  --service-drain-queue-mode after_run \
+  --reuse-service-ingest \
+  --pg-dsn "$OPENCLAW_PG_DSN" \
+  --provider openai \
+  --config hybrid \
+  --limit 48 --balanced
+
+# 兩階段模式（推薦）：
+# 1) 先 prepare 一次（只做寫入，不跑 QA，最快）
+python tests/benchmark/run_longmemeval_qa.py \
+  --pipeline service \
+  --prepare-only \
+  --service-write-mode distill \
+  --distill-batch-sessions 8 \
+  --answer-model gpt-4o-mini \
+  --service-resolver-mode off \
+  --service-drain-queue-mode never \
+  --reuse-service-ingest \
+  --pg-dsn "$OPENCLAW_PG_DSN" \
+  --provider openai \
+  --limit 48 --balanced
+
+# 2) 後續只跑 read + answer（跳過 ingest）
+# 注意：distill-batch-sessions 必須跟 prepare 相同
+python tests/benchmark/run_longmemeval_qa.py \
+  --pipeline service \
+  --read-answer-only \
+  --service-write-mode distill \
+  --distill-batch-sessions 8 \
+  --answer-model gpt-5-mini \
+  --service-resolver-mode off \
+  --service-drain-queue-mode never \
+  --pg-dsn "$OPENCLAW_PG_DSN" \
+  --provider openai \
+  --config hybrid \
+  --limit 48 --balanced
+
+# 一鍵跑兩階段（推薦，避免參數不一致）
+bash scripts/run_longmemeval_service.sh full
+```
+
+`scripts/run_longmemeval_service.sh` 可用環境變數覆蓋預設：
+
+- `OPENCLAW_PG_DSN`（預設 `postgresql://memuser:mempass@localhost:5433/memory`）
+- `LME_LIMIT`（預設 `48`）
+- `LME_DISTILL_BATCH`（預設 `8`）
+- `LME_PREP_MODEL`（預設 `gpt-4o-mini`）
+- `LME_QA_MODEL`（預設 `gpt-5-mini`）
+- `LME_RESOLVER_MODE`（預設 `off`）
+- `LME_DRAIN_MODE`（預設 `never`）
+
+若覺得 `service + distill` 太慢，可先用：
+
+- `--distill-batch-sessions 8`（降低 extraction 呼叫數）
+- `--answer-model gpt-4o-mini`（prepare 階段更快）
+- `--service-resolver-mode off`（先關 resolver，等需要再開）
+- `--reuse-service-ingest`（重跑時重用已寫入資料，避免每次重做 distill）
+- `--judge exact`（先關掉 LLM judge）
+- `--limit 6`（小樣本快速迭代）
+
+LongMemEval QA 指標解讀（重要）：
+
+- `retrieval_hit@5`: top-5 命中任一證據檔（寬鬆）
+- `retrieval_coverage@5`: top-5 覆蓋到的證據檔比例（較真實）
+- `retrieval_all_hit@5`: top-5 是否覆蓋所有證據檔（最嚴格）
+
+若 `retrieval_hit@5` 高、但 `retrieval_all_hit@5` 低，代表多半是「證據不完整」而非純回答模型問題。
+
+LoCoMo 下載（官方資料集）：
+
+```bash
+curl -L -o tests/benchmark/data/locomo10.json \
+  https://raw.githubusercontent.com/snap-research/locomo/main/data/locomo10.json
+```
+
+### 使用真實 Embedding（OpenAI API Key）
+
+真實 embedding benchmark 需要 `OPENAI_API_KEY`。系統支援從 `.env` 自動載入，**不需要額外安裝套件**：
+
+```bash
+# 在 repo 根目錄建立 .env（請勿 commit）
+echo "OPENAI_API_KEY=sk-..." > .env
+
+# 執行（系統自動讀取 .env）
+python tests/benchmark/run_sweep.py --run-real-embedding
+
+# 只跑 OpenAI（跳過 mock/fts）
+python tests/benchmark/run_real_embedding_benchmark.py --only-openai --longmemeval --limit 50
+```
+
+也可以明確指定 `.env` 路徑：
+
+```bash
+python tests/benchmark/run_sweep.py --run-real-embedding --dotenv /path/to/.env
+```
+
+若環境變數已存在則 `.env` 不會覆蓋它。`.env` 已在 `.gitignore` 中排除，不會被 commit。
+
+---
+
+## Quality Commands（品質指令）
+
+在 commit 或 PR 前，建議執行以下指令確保程式碼品質。
+
+### Lint（ruff）
+
+```bash
+ruff check src/ tests/
+```
+
+自動修復可修正的問題：
+
+```bash
+ruff check --fix src/ tests/
+```
+
+### Type Check（mypy）
+
+```bash
+mypy src/openclaw_memory/
+```
+
+### Unit Tests（pytest）
+
+```bash
+# 所有單元測試（不需要 DB，快速）
+pytest tests/unit/ -v
+
+# 特定測試檔
+pytest tests/unit/test_working_memory.py -v
+```
+
+### Integration Tests（需要 PostgreSQL）
+
+```bash
+# 啟動測試用 pgvector（ephemeral）
+docker compose -f docker-compose.test.yml up -d
+
+# 執行 integration tests
+pytest tests/integration/ -v
+
+# 清除
+docker compose -f docker-compose.test.yml down -v
+```
+
+### Service 三層流程測試（LongMemEval QA）
+
+```bash
+# 1) 啟動本地 PG（persistent）
+bash scripts/pgvector_local.sh start
+bash scripts/pgvector_local.sh init
+export OPENCLAW_PG_DSN="postgresql://memuser:mempass@localhost:5433/memory"
+
+# 2) 小樣本 smoke test（先寫入）
+LME_LIMIT=6 LME_DISTILL_BATCH=8 bash scripts/run_longmemeval_service.sh prepare
+
+# 3) 小樣本讀取 + 回答（不重做 ingest）
+LME_LIMIT=6 LME_DISTILL_BATCH=8 bash scripts/run_longmemeval_service.sh read
+```
+
+### 一次執行所有品質檢查
+
+```bash
+ruff check src/ tests/ && mypy src/openclaw_memory/ && pytest tests/unit/ -v
+```
+
+若 repo 內有 `scripts/quality.sh`，也可以直接執行：
+
+```bash
+bash scripts/quality.sh
+```
+
+`scripts/quality.sh` 會依序執行：ruff → mypy → pytest → benchmark。
+**所有步驟都必須通過**，quality gate 才算成功。
+注意：benchmark 目前使用 LongMemEval + OpenAI embeddings，必須提供
+`OPENAI_API_KEY`（可從 `.env` 載入）。
+
+---
+
+## Enforced Benchmarks（品質門檻中的 Benchmark）
+
+Benchmark 是品質工作流程的一部分，由 `scripts/quality.sh` 自動觸發。
+
+### scripts/benchmark.sh
+
+```bash
+# 手動執行 benchmark（需要 OPENAI_API_KEY）
+bash scripts/benchmark.sh
+```
+
+這個腳本會：
+1. 執行 LongMemEval（OpenAI embeddings）：
+   `python tests/benchmark/run_real_embedding_benchmark.py --longmemeval --limit 50`
+2. 將結果寫入 `tests/benchmark/results_real_vs_mock.json`
+3. 呼叫報告產生器，更新 `docs/benchmark-report.md`
+
+**這是「真實 benchmark」流程**，需要 `OPENAI_API_KEY`（可從 `.env` 載入）。
+
+### docs/benchmark-report.md（自動產生）
+
+`docs/benchmark-report.md` 是由 `scripts/generate_benchmark_report.py` 自動產生的，**不要手動編輯**。
+每次執行 `scripts/benchmark.sh` 都會重新產生，內容包含：
+
+- 產生時間戳
+- LongMemEval 的 OpenAI 結果摘要
+- 全部 LongMemEval 結果表（含 provider / config）
+- OpenAI 的 per-type breakdown
+- 若存在 `tests/benchmark/results_longmemeval_qa.json`，會額外包含 LongMemEval QA（端到端）結果
+
+手動觸發報告產生：
+
+```bash
+python scripts/generate_benchmark_report.py \
+    --input tests/benchmark/results_real_vs_mock.json \
+    --output docs/benchmark-report.md \
+    --qa-input tests/benchmark/results_longmemeval_qa.json
+```
+
+### OpenAI API Key（必要）
+
+請在 repo 根目錄建立 `.env`（請勿 commit）：
+
+```bash
+echo "OPENAI_API_KEY=sk-..." > .env
+```
+
+執行 benchmark：
+
+```bash
+bash scripts/benchmark.sh
+```

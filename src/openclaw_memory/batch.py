@@ -11,6 +11,12 @@ from typing import Any
 from .dedup import DBConnection, store_with_dedup
 from .embeddings import EmbeddingProvider
 from .extraction import ExtractedMemory, extract_memories
+from .lightmem import (
+    DistillPrepConfig,
+    estimate_tokens,
+    normalize_messages_use,
+    prepare_messages_for_distill,
+)
 
 
 class MemoryBatchProcessor:
@@ -28,15 +34,36 @@ class MemoryBatchProcessor:
         conn: DBConnection | None = None,
         embedding_provider: EmbeddingProvider | None = None,
         similarity_threshold: float = 0.85,
+        token_buffer_threshold: int | None = None,
+        distill_pre_compress: bool = False,
+        distill_messages_use: str = "all",
+        distill_topic_segment: bool = False,
+        distill_max_tokens: int = 2200,
+        distill_topic_threshold: int = 600,
     ) -> None:
         self.buffer_size = buffer_size
         self.llm_fn = llm_fn
         self.conn = conn
         self.embedding_provider = embedding_provider
         self.similarity_threshold = similarity_threshold
+        self.token_buffer_threshold = (
+            max(64, int(token_buffer_threshold))
+            if token_buffer_threshold is not None
+            else None
+        )
 
         # user_id -> list of message dicts
         self._buffer: dict[str, list[dict[str, Any]]] = {}
+        self._buffer_tokens: dict[str, int] = {}
+
+        # LightMem-style extraction input preparation for batched flushes.
+        self._distill_config = DistillPrepConfig(
+            pre_compress=distill_pre_compress,
+            messages_use=normalize_messages_use(distill_messages_use),
+            topic_segment=distill_topic_segment,
+            max_input_tokens=max(64, int(distill_max_tokens)),
+            topic_token_threshold=max(64, int(distill_topic_threshold)),
+        )
 
     # ------------------------------------------------------------------
     # Buffering
@@ -45,13 +72,25 @@ class MemoryBatchProcessor:
     def buffer_conversation(self, user_id: str, messages: list[dict[str, Any]]) -> None:
         """
         Add *messages* to the per-user buffer.
-        Automatically flushes when the buffer reaches *buffer_size*.
+
+        Auto flush triggers when either:
+          - buffered message count reaches ``buffer_size``, or
+          - estimated token count reaches ``token_buffer_threshold`` (if set).
         """
         if user_id not in self._buffer:
             self._buffer[user_id] = []
-        self._buffer[user_id].extend(messages)
+            self._buffer_tokens[user_id] = 0
 
-        if len(self._buffer[user_id]) >= self.buffer_size:
+        self._buffer[user_id].extend(messages)
+        added_tokens = sum(estimate_tokens(str(msg.get("content", ""))) for msg in messages)
+        self._buffer_tokens[user_id] = self._buffer_tokens.get(user_id, 0) + added_tokens
+
+        over_size = len(self._buffer[user_id]) >= self.buffer_size
+        over_tokens = (
+            self.token_buffer_threshold is not None
+            and self._buffer_tokens.get(user_id, 0) >= self.token_buffer_threshold
+        )
+        if over_size or over_tokens:
             self.flush(user_id)
 
     # ------------------------------------------------------------------
@@ -66,6 +105,7 @@ class MemoryBatchProcessor:
         no memories were found). The buffer for this user is cleared afterwards.
         """
         messages = self._buffer.pop(user_id, [])
+        self._buffer_tokens.pop(user_id, None)
         if not messages:
             return []
 
@@ -78,7 +118,9 @@ class MemoryBatchProcessor:
             ts = msg.get("timestamp") or msg.get("ts")
             source_refs.append(str(ts) if ts is not None else str(idx))
 
-        memories = extract_memories(messages, self.llm_fn)
+        prepared = prepare_messages_for_distill(messages, config=self._distill_config)
+        extraction_input: list[dict[str, Any]] = prepared if prepared else messages
+        memories = extract_memories(extraction_input, self.llm_fn)
 
         # Propagate source_refs into memories that don't already have them
         for mem in memories:
@@ -117,6 +159,10 @@ class MemoryBatchProcessor:
     def buffer_size_for(self, user_id: str) -> int:
         """Return the current number of buffered messages for *user_id*."""
         return len(self._buffer.get(user_id, []))
+
+    def buffered_tokens_for(self, user_id: str) -> int:
+        """Return the estimated buffered token count for *user_id*."""
+        return self._buffer_tokens.get(user_id, 0)
 
     def buffered_users(self) -> list[str]:
         """Return the list of user IDs that have buffered messages."""

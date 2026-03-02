@@ -123,6 +123,24 @@ CREATE INDEX IF NOT EXISTS idx_canonical_user_id
 
 CREATE INDEX IF NOT EXISTS idx_canonical_embedding_hnsw
     ON canonical_memories USING hnsw (embedding vector_cosine_ops);
+
+CREATE TABLE IF NOT EXISTS memory_update_queue (
+    id            BIGSERIAL   PRIMARY KEY,
+    user_id       TEXT        NOT NULL,
+    payload       JSONB       NOT NULL,
+    status        TEXT        NOT NULL DEFAULT 'pending',
+    attempts      INTEGER     NOT NULL DEFAULT 0,
+    last_error    TEXT,
+    available_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_update_queue_status_time
+    ON memory_update_queue (status, available_at);
+
+CREATE INDEX IF NOT EXISTS idx_memory_update_queue_user_status
+    ON memory_update_queue (user_id, status);
 """
 
 
