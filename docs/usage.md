@@ -1041,6 +1041,7 @@ python tests/benchmark/run_longmemeval_qa.py \
   --prepare-only \
   --service-write-mode distill \
   --distill-batch-sessions 8 \
+  --service-workers 4 \
   --answer-model gpt-4o-mini \
   --service-resolver-mode off \
   --service-drain-queue-mode never \
@@ -1056,6 +1057,7 @@ python tests/benchmark/run_longmemeval_qa.py \
   --read-answer-only \
   --service-write-mode distill \
   --distill-batch-sessions 8 \
+  --service-workers 4 \
   --answer-model gpt-5-mini \
   --service-resolver-mode off \
   --service-drain-queue-mode never \
@@ -1077,10 +1079,12 @@ bash scripts/run_longmemeval_service.sh full
 - `LME_QA_MODEL`（預設 `gpt-5-mini`）
 - `LME_RESOLVER_MODE`（預設 `off`）
 - `LME_DRAIN_MODE`（預設 `never`）
+- `LME_SERVICE_WORKERS`（預設 `2`，平行 prepare worker 數）
 
 若覺得 `service + distill` 太慢，可先用：
 
 - `--distill-batch-sessions 8`（降低 extraction 呼叫數）
+- `--service-workers 2~4`（平行跑 prepare，各題不用等上一題）
 - `--answer-model gpt-4o-mini`（prepare 階段更快）
 - `--service-resolver-mode off`（先關 resolver，等需要再開）
 - `--reuse-service-ingest`（重跑時重用已寫入資料，避免每次重做 distill）

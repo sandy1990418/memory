@@ -28,6 +28,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections.abc import Callable
 from collections import Counter
 from pathlib import Path
@@ -837,6 +838,104 @@ def _service_ingest_distilled_sessions(
         service.ingest_conversation(user_id, f"batch_{batch_idx:04d}", merged)
 
 
+def _prepare_service_instance(
+    *,
+    idx: int,
+    total: int,
+    inst: dict[str, Any],
+    provider: Any,
+    provider_label: str,
+    pg_dsn: str,
+    llm_fn: Callable[[str], str],
+    service_write_mode: str,
+    distill_batch_sessions: int,
+    service_lightmem: bool,
+    normalized_resolver_mode: str,
+    normalized_drain_mode: str,
+    service_drain_queue_limit: int,
+    service_drain_queue_max_attempts: int,
+    service_official_batching: bool,
+    service_batch_system_prompt: str,
+    force_reindex: bool,
+    reuse_service_ingest: bool,
+) -> dict[str, Any]:
+    qid = str(inst.get("question_id", f"idx-{idx}"))
+    qtype = str(inst.get("question_type", "unknown"))
+    item_start = time.time()
+
+    try:
+        user_id = _service_user_id_for_instance(
+            provider_label,
+            qid,
+            service_write_mode,
+            distill_batch_sessions,
+        )
+        has_data = _service_user_has_data(pg_dsn, user_id)
+        should_ingest = True
+        if not force_reindex and reuse_service_ingest and has_data:
+            should_ingest = False
+
+        drain_stats: dict[str, int] | None = None
+        if should_ingest:
+            _service_reset_user_data(pg_dsn, user_id)
+            if service_write_mode == "distill":
+                service = _build_memory_service(
+                    pg_dsn=pg_dsn,
+                    provider=provider,
+                    llm_fn=llm_fn,
+                    service_write_mode=service_write_mode,
+                    service_lightmem=service_lightmem,
+                    service_resolver_mode=normalized_resolver_mode,
+                )
+                _service_ingest_distilled_sessions(
+                    service,
+                    user_id,
+                    inst,
+                    batch_sessions=distill_batch_sessions,
+                    official_batching=service_official_batching,
+                    batch_system_prompt=service_batch_system_prompt,
+                )
+                if normalized_drain_mode == "after_ingest":
+                    drain_stats = service.drain_update_queue(
+                        limit=service_drain_queue_limit,
+                        user_id=user_id,
+                        max_attempts=service_drain_queue_max_attempts,
+                    )
+            else:
+                _service_ingest_raw_sessions(pg_dsn, user_id, inst, provider)
+
+        elapsed = time.time() - item_start
+        return {
+            "idx": idx,
+            "question_id": qid,
+            "question_type": qtype,
+            "prepared": True,
+            "ingested": should_ingest,
+            "reused": not should_ingest,
+            "queue_drain": drain_stats,
+            "elapsed_s": round(elapsed, 1),
+            "log": (
+                f"  [prepare {idx+1}/{total}] {qid} ({qtype})\n"
+                f"    prepared in {elapsed:.1f}s | ingested={int(should_ingest)} "
+                f"reused={int(not should_ingest)}"
+            ),
+        }
+    except Exception as exc:
+        elapsed = time.time() - item_start
+        return {
+            "idx": idx,
+            "question_id": qid,
+            "question_type": qtype,
+            "prepared": False,
+            "error": str(exc),
+            "elapsed_s": round(elapsed, 1),
+            "log": (
+                f"  [prepare {idx+1}/{total}] {qid} ({qtype})\n"
+                f"    FAILED in {elapsed:.1f}s: {exc}"
+            ),
+        }
+
+
 def prepare_longmemeval_service_data(
     instances: list[dict[str, Any]],
     *,
@@ -853,6 +952,7 @@ def prepare_longmemeval_service_data(
     service_drain_queue_max_attempts: int,
     service_official_batching: bool,
     service_batch_system_prompt: str,
+    service_workers: int,
     force_reindex: bool,
     reuse_service_ingest: bool,
 ) -> dict[str, Any]:
@@ -866,100 +966,127 @@ def prepare_longmemeval_service_data(
         service_write_mode,
         normalized_resolver_mode,
     )
-    service = _build_memory_service(
-        pg_dsn=pg_dsn,
-        provider=provider,
-        llm_fn=llm_fn,
-        service_write_mode=service_write_mode,
-        service_lightmem=service_lightmem,
-        service_resolver_mode=normalized_resolver_mode,
-    )
+    worker_n = max(1, int(service_workers))
 
     prepared_new = 0
     reused_existing = 0
     errors = 0
     drain_total = {"claimed": 0, "processed": 0, "retried": 0, "failed": 0}
     drain_after_run: dict[str, int] | None = None
-    per_instance: list[dict[str, Any]] = []
+    per_instance_by_idx: dict[int, dict[str, Any]] = {}
     t0 = time.time()
 
-    for idx, inst in enumerate(instances):
-        qid = str(inst.get("question_id", f"idx-{idx}"))
-        qtype = str(inst.get("question_type", "unknown"))
-        item_start = time.time()
-        print(f"  [prepare {idx+1}/{len(instances)}] {qid} ({qtype})", flush=True)
-        try:
-            user_id = _service_user_id_for_instance(
-                provider_label, qid, service_write_mode, distill_batch_sessions
+    if worker_n == 1:
+        for idx, inst in enumerate(instances):
+            result = _prepare_service_instance(
+                idx=idx,
+                total=len(instances),
+                inst=inst,
+                provider=provider,
+                provider_label=provider_label,
+                pg_dsn=pg_dsn,
+                llm_fn=llm_fn,
+                service_write_mode=service_write_mode,
+                distill_batch_sessions=distill_batch_sessions,
+                service_lightmem=service_lightmem,
+                normalized_resolver_mode=normalized_resolver_mode,
+                normalized_drain_mode=normalized_drain_mode,
+                service_drain_queue_limit=service_drain_queue_limit,
+                service_drain_queue_max_attempts=service_drain_queue_max_attempts,
+                service_official_batching=service_official_batching,
+                service_batch_system_prompt=service_batch_system_prompt,
+                force_reindex=force_reindex,
+                reuse_service_ingest=reuse_service_ingest,
             )
-            has_data = _service_user_has_data(pg_dsn, user_id)
-            should_ingest = True
-            drain_stats: dict[str, int] | None = None
-            if not force_reindex and reuse_service_ingest and has_data:
-                should_ingest = False
-
-            if should_ingest:
-                _service_reset_user_data(pg_dsn, user_id)
-                if service_write_mode == "distill":
-                    _service_ingest_distilled_sessions(
-                        service,
-                        user_id,
-                        inst,
-                        batch_sessions=distill_batch_sessions,
-                        official_batching=service_official_batching,
-                        batch_system_prompt=service_batch_system_prompt,
-                    )
+            print(result["log"], flush=True)
+            if result.get("prepared"):
+                if result.get("ingested"):
+                    prepared_new += 1
                 else:
-                    _service_ingest_raw_sessions(pg_dsn, user_id, inst, provider)
-                if normalized_drain_mode == "after_ingest":
-                    drain_stats = service.drain_update_queue(
-                        limit=service_drain_queue_limit,
-                        user_id=user_id,
-                        max_attempts=service_drain_queue_max_attempts,
-                    )
-                    _accumulate_queue_stats(drain_total, drain_stats)
-                prepared_new += 1
+                    reused_existing += 1
+                _accumulate_queue_stats(drain_total, result.get("queue_drain"))
             else:
-                reused_existing += 1
-
-            elapsed = time.time() - item_start
-            print(
-                f"    prepared in {elapsed:.1f}s | ingested={int(should_ingest)} "
-                f"reused={int(not should_ingest)}",
-                flush=True,
-            )
-            per_instance.append(
-                {
-                    "question_id": qid,
-                    "question_type": qtype,
-                    "prepared": True,
-                    "ingested": should_ingest,
-                    "reused": not should_ingest,
-                    "queue_drain": drain_stats,
-                    "elapsed_s": round(elapsed, 1),
-                }
-            )
-        except Exception as exc:
-            errors += 1
-            elapsed = time.time() - item_start
-            print(f"    FAILED in {elapsed:.1f}s: {exc}", flush=True)
-            per_instance.append(
-                {
-                    "question_id": qid,
-                    "question_type": qtype,
-                    "prepared": False,
-                    "error": str(exc),
-                    "elapsed_s": round(elapsed, 1),
-                }
-            )
+                errors += 1
+            result_copy = {k: v for k, v in result.items() if k not in {"idx", "log"}}
+            per_instance_by_idx[int(result["idx"])] = result_copy
+    else:
+        print(
+            f"  prepare workers={worker_n} (service pipeline parallel mode)",
+            flush=True,
+        )
+        with ThreadPoolExecutor(max_workers=worker_n) as executor:
+            future_map = {
+                executor.submit(
+                    _prepare_service_instance,
+                    idx=idx,
+                    total=len(instances),
+                    inst=inst,
+                    provider=provider,
+                    provider_label=provider_label,
+                    pg_dsn=pg_dsn,
+                    llm_fn=llm_fn,
+                    service_write_mode=service_write_mode,
+                    distill_batch_sessions=distill_batch_sessions,
+                    service_lightmem=service_lightmem,
+                    normalized_resolver_mode=normalized_resolver_mode,
+                    normalized_drain_mode=normalized_drain_mode,
+                    service_drain_queue_limit=service_drain_queue_limit,
+                    service_drain_queue_max_attempts=service_drain_queue_max_attempts,
+                    service_official_batching=service_official_batching,
+                    service_batch_system_prompt=service_batch_system_prompt,
+                    force_reindex=force_reindex,
+                    reuse_service_ingest=reuse_service_ingest,
+                ): idx
+                for idx, inst in enumerate(instances)
+            }
+            for future in as_completed(future_map):
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    idx = future_map[future]
+                    qid = str(instances[idx].get("question_id", f"idx-{idx}"))
+                    qtype = str(instances[idx].get("question_type", "unknown"))
+                    result = {
+                        "idx": idx,
+                        "question_id": qid,
+                        "question_type": qtype,
+                        "prepared": False,
+                        "error": str(exc),
+                        "elapsed_s": 0.0,
+                        "log": (
+                            f"  [prepare {idx+1}/{len(instances)}] {qid} ({qtype})\n"
+                            f"    FAILED in 0.0s: {exc}"
+                        ),
+                    }
+                print(result["log"], flush=True)
+                if result.get("prepared"):
+                    if result.get("ingested"):
+                        prepared_new += 1
+                    else:
+                        reused_existing += 1
+                    _accumulate_queue_stats(drain_total, result.get("queue_drain"))
+                else:
+                    errors += 1
+                result_copy = {k: v for k, v in result.items() if k not in {"idx", "log"}}
+                per_instance_by_idx[int(result["idx"])] = result_copy
 
     if normalized_drain_mode == "after_run":
+        service = _build_memory_service(
+            pg_dsn=pg_dsn,
+            provider=provider,
+            llm_fn=llm_fn,
+            service_write_mode=service_write_mode,
+            service_lightmem=service_lightmem,
+            service_resolver_mode=normalized_resolver_mode,
+        )
         drain_after_run = service.drain_update_queue(
             limit=service_drain_queue_limit,
             user_id=None,
             max_attempts=service_drain_queue_max_attempts,
         )
         _accumulate_queue_stats(drain_total, drain_after_run)
+
+    per_instance = [per_instance_by_idx[i] for i in sorted(per_instance_by_idx)]
 
     return {
         "provider": provider_label,
@@ -972,6 +1099,7 @@ def prepare_longmemeval_service_data(
         ),
         "service_drain_queue_mode": normalized_drain_mode,
         "service_official_batching": service_official_batching if service_write_mode == "distill" else None,
+        "service_workers": worker_n,
         "mode": "prepare_only",
         "instances": len(instances),
         "elapsed_s": round(time.time() - t0, 1),
@@ -1710,6 +1838,15 @@ def main() -> None:
         help="System prompt injected for official distill batching when batch size > 1",
     )
     parser.add_argument(
+        "--service-workers",
+        type=int,
+        default=1,
+        help=(
+            "Parallel workers for service prepare phase (default: 1). "
+            "Use 2-4 to reduce wall-clock time."
+        ),
+    )
+    parser.add_argument(
         "--distill-batch-sessions",
         type=int,
         default=2,
@@ -1805,6 +1942,8 @@ def main() -> None:
     _load_dotenv()
     if args.distill_batch_sessions < 1:
         raise SystemExit("--distill-batch-sessions must be >= 1")
+    if args.service_workers < 1:
+        raise SystemExit("--service-workers must be >= 1")
     if args.service_drain_queue_limit < 1:
         raise SystemExit("--service-drain-queue-limit must be >= 1")
     if args.service_drain_queue_max_attempts < 1:
@@ -1870,7 +2009,8 @@ def main() -> None:
                 f"resolver={normalized_service_resolver_mode} "
                 f"drain_queue={normalized_service_drain_mode} "
                 f"batch_sessions={args.distill_batch_sessions} "
-                f"official_batching={int(args.service_official_batching)}",
+                f"official_batching={int(args.service_official_batching)} "
+                f"workers={args.service_workers}",
                 flush=True,
             )
     elif args.prepare_only or args.read_answer_only:
@@ -1950,6 +2090,7 @@ def main() -> None:
                 service_drain_queue_max_attempts=args.service_drain_queue_max_attempts,
                 service_official_batching=args.service_official_batching,
                 service_batch_system_prompt=args.service_batch_system_prompt,
+                service_workers=args.service_workers,
                 force_reindex=args.force_reindex,
                 reuse_service_ingest=args.reuse_service_ingest,
             )
@@ -2041,6 +2182,7 @@ def main() -> None:
             if args.pipeline == "service" and args.service_write_mode == "distill"
             else None
         ),
+        "service_workers": args.service_workers if args.pipeline == "service" else None,
         "reuse_service_ingest": args.reuse_service_ingest,
         "prepare_only": args.prepare_only,
         "read_answer_only": args.read_answer_only,
