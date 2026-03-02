@@ -49,7 +49,7 @@ def _resolve_db_path(workspace: str) -> str:
 
 def _get_manager(workspace: str | None = None) -> Any:
     """Create a MemoryIndexManager from env config."""
-    from ..manager import MemoryIndexManager
+    from ..index.manager import MemoryIndexManager
 
     ws = _resolve_workspace(workspace)
     db_path = _resolve_db_path(ws)

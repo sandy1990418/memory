@@ -11,7 +11,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from .internal import (
+from ._utils import (
     MemoryFileEntry,
     build_file_entry,
     chunk_markdown,
@@ -121,7 +121,7 @@ def _get_cached_embedding(
         (provider, model, provider_key, text_hash),
     ).fetchone()
     if row:
-        from .internal import parse_embedding
+        from ._utils import parse_embedding
 
         return parse_embedding(row[0])
     return None

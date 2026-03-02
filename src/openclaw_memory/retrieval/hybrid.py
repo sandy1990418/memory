@@ -9,7 +9,7 @@ import re
 from typing import Any
 
 from .mmr import MMRConfig, apply_mmr_to_hybrid_results
-from .temporal_decay import TemporalDecayConfig, apply_temporal_decay_to_results
+from .decay import TemporalDecayConfig, apply_temporal_decay_to_results
 
 
 def build_fts_query(raw: str) -> str | None:

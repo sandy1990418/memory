@@ -11,7 +11,7 @@ import os
 from collections.abc import Generator
 from pathlib import Path
 
-from .types import MemoryChunk, MemoryFileEntry
+from ..types import MemoryChunk, MemoryFileEntry
 
 __all__ = [
     "MemoryFileEntry",

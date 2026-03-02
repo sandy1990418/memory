@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
-from .embeddings import EmbeddingProvider
+from ..embeddings import EmbeddingProvider
 from .extraction import ExtractedMemory
 
 if TYPE_CHECKING:

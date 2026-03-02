@@ -9,9 +9,9 @@ Public API:
 """
 
 from .config import ResolvedMemorySearchConfig, resolve_memory_search_config
-from .consolidation import ConsolidationReport, MemoryConsolidator
-from .manager import MemoryIndexManager
-from .short_term_buffer import BufferConfig, ShortTermBuffer
+from .ingest.consolidation import ConsolidationReport, MemoryConsolidator
+from .index.manager import MemoryIndexManager
+from .ingest.buffer import BufferConfig, ShortTermBuffer
 from .types import (
     MemoryChunk,
     MemoryContext,

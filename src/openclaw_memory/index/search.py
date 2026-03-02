@@ -9,7 +9,7 @@ import re
 import sqlite3
 from typing import Any
 
-from .internal import cosine_similarity, parse_embedding, truncate_utf16_safe
+from ._utils import cosine_similarity, parse_embedding, truncate_utf16_safe
 
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -100,11 +100,11 @@ def search_keyword(
 
     # Import defaults lazily to avoid circular imports
     if build_fts_query_fn is None:
-        from .hybrid import build_fts_query
+        from ..retrieval.hybrid import build_fts_query
 
         build_fts_query_fn = build_fts_query
     if bm25_rank_to_score_fn is None:
-        from .hybrid import bm25_rank_to_score
+        from ..retrieval.hybrid import bm25_rank_to_score
 
         bm25_rank_to_score_fn = bm25_rank_to_score
 

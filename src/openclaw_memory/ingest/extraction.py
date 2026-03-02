@@ -11,7 +11,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from .memory_normalize import (
+from .normalize import (
     apply_type_fallback,
     normalize_memory_key,
     normalize_value,

@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
-from .embeddings import EmbeddingProvider
+from ..embeddings import EmbeddingProvider
 
 if TYPE_CHECKING:
     import psycopg

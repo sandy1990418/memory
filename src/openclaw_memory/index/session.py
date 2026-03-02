@@ -10,7 +10,7 @@ import re
 from collections.abc import Callable
 from datetime import datetime, timezone
 
-from .internal import ensure_dir
+from ._utils import ensure_dir
 
 __all__ = [
     "save_session_to_memory",

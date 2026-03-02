@@ -23,32 +23,32 @@ import json
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
-from .answer_contract import AnswerPayload, generate_answer
-from .consolidation import ConsolidationReport, MemoryConsolidator
+from .retrieval.answer import AnswerPayload, generate_answer
+from .ingest.consolidation import ConsolidationReport, MemoryConsolidator
 from .embeddings import EmbeddingProvider
-from .extraction import ExtractedMemory, extract_memories
-from .hybrid import merge_hybrid_results
-from .lightmem import (
+from .ingest.extraction import ExtractedMemory, extract_memories
+from .retrieval.hybrid import merge_hybrid_results
+from .ingest.sensory import (
     DistillPrepConfig,
     build_compact_session_text,
     normalize_messages_use,
     prepare_messages_for_distill,
 )
-from .llm_rerank import llm_rerank
-from .mmr import MMRConfig, apply_mmr_to_hybrid_results
-from .pg_schema import get_pg_connection
-from .pg_search import (
+from .retrieval.rerank import llm_rerank
+from .retrieval.mmr import MMRConfig, apply_mmr_to_hybrid_results
+from .pg.schema import get_pg_connection
+from .pg.search import (
     pg_get_memories_by_ids,
     pg_get_timeline,
     pg_search_compact,
     pg_search_keyword,
     pg_search_vector,
 )
-from .query_expansion import extract_keywords
-from .short_term_buffer import BufferConfig, ShortTermBuffer
-from .temporal_decay import TemporalDecayConfig, apply_temporal_decay_by_created_at
+from .retrieval.query import extract_keywords
+from .ingest.buffer import BufferConfig, ShortTermBuffer
+from .retrieval.decay import TemporalDecayConfig, apply_temporal_decay_by_created_at
 from .types import MemoryContext, MemoryIndex, MemorySearchResult
-from .working_memory import DBWorkingMemory, WorkingMemory
+from .pg.working import DBWorkingMemory, WorkingMemory
 
 if TYPE_CHECKING:
     import psycopg
@@ -350,7 +350,7 @@ class MemoryService:
         cannot be used.
         """
         try:
-            from .conflict_resolver import apply_resolution, resolve_conflict  # noqa: PLC0415
+            from .ingest.conflict import apply_resolution, resolve_conflict  # noqa: PLC0415
 
             resolutions = resolve_conflict(
                 conn, user_id, memory, self._embedding_provider,
@@ -1138,7 +1138,7 @@ class MemoryService:
         retried = 0
         failed = 0
 
-        from .conflict_resolver import apply_resolution, resolve_conflict  # noqa: PLC0415
+        from .ingest.conflict import apply_resolution, resolve_conflict  # noqa: PLC0415
 
         for queue_id, queue_user_id, payload, attempts in claimed:
             item_conn = self._get_conn()

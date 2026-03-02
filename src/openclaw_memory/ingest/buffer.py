@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
-from .lightmem import estimate_tokens
+from .sensory import estimate_tokens
 
 if TYPE_CHECKING:
     import psycopg

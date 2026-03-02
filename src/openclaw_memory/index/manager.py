@@ -13,18 +13,18 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from .config import ResolvedMemorySearchConfig, resolve_memory_search_config
-from .embeddings import EmbeddingProvider, create_embedding_provider
-from .hybrid import merge_hybrid_results
-from .internal import (
+from ..config import ResolvedMemorySearchConfig, resolve_memory_search_config
+from ..embeddings import EmbeddingProvider, create_embedding_provider
+from ..retrieval.hybrid import merge_hybrid_results
+from ._utils import (
     is_memory_path,
     normalize_extra_memory_paths,
 )
-from .manager_search import search_keyword, search_vector
-from .query_expansion import extract_keywords
+from .search import search_keyword, search_vector
+from ..retrieval.query import extract_keywords
 from .schema import ensure_memory_index_schema
 from .sync import sync_memory_files
-from .types import MemoryEmbeddingProbeResult, MemoryProviderStatus, MemorySearchResult
+from ..types import MemoryEmbeddingProbeResult, MemoryProviderStatus, MemorySearchResult
 
 _SNIPPET_MAX_CHARS = 700
 _FTS_TABLE = "chunks_fts"
