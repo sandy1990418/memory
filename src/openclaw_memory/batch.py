@@ -10,8 +10,8 @@ from typing import Any
 
 from .dedup import DBConnection, store_with_dedup
 from .embeddings import EmbeddingProvider
-from .extraction import ExtractedMemory, extract_memories
-from .lightmem import (
+from .ingest.extraction import ExtractedMemory, extract_memories
+from .ingest.sensory import (
     DistillPrepConfig,
     estimate_tokens,
     normalize_messages_use,
