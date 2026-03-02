@@ -15,6 +15,7 @@ fi
 PG_DSN="${OPENCLAW_PG_DSN:-postgresql://memuser:mempass@localhost:5433/memory}"
 PROVIDER="${LME_PROVIDER:-openai}"
 CONFIG="${LME_CONFIG:-hybrid}"
+WRITE_MODE="${LME_WRITE_MODE:-distill}"
 OUTPUT="${LME_OUTPUT:-tests/benchmark/results_longmemeval_qa.json}"
 LIMIT="${LME_LIMIT:-48}"
 BALANCED="${LME_BALANCED:-0}"
@@ -59,6 +60,7 @@ Common env overrides:
   OPENCLAW_PG_DSN=${PG_DSN}
   LME_LIMIT=${LIMIT}
   LME_DISTILL_BATCH=${DISTILL_BATCH}
+  LME_WRITE_MODE=${WRITE_MODE}
   LME_PREP_MODEL=${PREP_MODEL}
   LME_QA_MODEL=${QA_MODEL}
   LME_RESOLVER_MODE=${RESOLVER_MODE}
@@ -78,7 +80,7 @@ fi
 base_cmd=(
   python tests/benchmark/run_longmemeval_qa.py
   --pipeline service
-  --service-write-mode distill
+  --service-write-mode "${WRITE_MODE}"
   --pg-dsn "${PG_DSN}"
   --provider "${PROVIDER}"
   --config "${CONFIG}"
@@ -109,7 +111,7 @@ fi
 
 run_prepare() {
   echo "== Phase: prepare =="
-  echo "prepare config: model=${PREP_MODEL} workers=${SERVICE_WORKERS} distill_batch=${DISTILL_BATCH}"
+  echo "prepare config: mode=${WRITE_MODE} model=${PREP_MODEL} workers=${SERVICE_WORKERS} distill_batch=${DISTILL_BATCH}"
   "${base_cmd[@]}" \
     --prepare-only \
     --answer-model "${PREP_MODEL}" \

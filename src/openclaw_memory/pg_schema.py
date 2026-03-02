@@ -18,8 +18,10 @@ if TYPE_CHECKING:
     # Only imported for type-checking; psycopg is lazy-loaded at runtime.
     import psycopg
 
-# Path to the bundled SQL migration file.
-_MIGRATION_SQL = Path(__file__).parent.parent.parent / "migrations" / "001_initial_schema.sql"
+# Path to the bundled SQL migration files.
+_MIGRATIONS_DIR = Path(__file__).parent.parent.parent / "migrations"
+_MIGRATION_SQL = _MIGRATIONS_DIR / "001_initial_schema.sql"
+_MIGRATION_002_SQL = _MIGRATIONS_DIR / "002_consolidation.sql"
 
 # Fallback inline SQL in case the file is not found (e.g. installed as a wheel
 # without the migrations/ directory).  Kept in sync with the .sql file.
@@ -143,6 +145,51 @@ CREATE INDEX IF NOT EXISTS idx_memory_update_queue_user_status
     ON memory_update_queue (user_id, status);
 """
 
+_INLINE_SQL_002 = """
+CREATE TABLE IF NOT EXISTS short_term_buffer (
+    id          UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id     TEXT        NOT NULL,
+    thread_id   TEXT,
+    messages    JSONB       NOT NULL DEFAULT '[]',
+    topic_summary TEXT,
+    token_count INTEGER     NOT NULL DEFAULT 0,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_stb_user_id
+    ON short_term_buffer (user_id);
+
+CREATE INDEX IF NOT EXISTS idx_stb_user_updated
+    ON short_term_buffer (user_id, updated_at DESC);
+
+ALTER TABLE canonical_memories
+    ADD COLUMN IF NOT EXISTS consolidated_from UUID[] DEFAULT '{}';
+
+ALTER TABLE canonical_memories
+    ADD COLUMN IF NOT EXISTS consolidation_round INTEGER NOT NULL DEFAULT 0;
+
+ALTER TABLE canonical_memories
+    ADD COLUMN IF NOT EXISTS last_consolidated_at TIMESTAMPTZ;
+
+CREATE TABLE IF NOT EXISTS consolidation_log (
+    id                  BIGSERIAL   PRIMARY KEY,
+    user_id             TEXT        NOT NULL,
+    started_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    finished_at         TIMESTAMPTZ,
+    memories_scanned    INTEGER     NOT NULL DEFAULT 0,
+    memories_merged     INTEGER     NOT NULL DEFAULT 0,
+    memories_deleted    INTEGER     NOT NULL DEFAULT 0,
+    memories_abstracted INTEGER     NOT NULL DEFAULT 0,
+    status              TEXT        NOT NULL DEFAULT 'running',
+    error               TEXT,
+    metadata            JSONB       NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_consolidation_log_user_started
+    ON consolidation_log (user_id, started_at DESC);
+"""
+
 
 # ---------------------------------------------------------------------------
 # Config
@@ -190,20 +237,20 @@ def get_pg_connection(dsn: str) -> psycopg.Connection[Any]:
 # ---------------------------------------------------------------------------
 
 
-def _load_migration_sql() -> str:
+def _load_migration_sql(migration_path: Path, inline_fallback: str) -> str:
     """Return the migration SQL, preferring the .sql file on disk."""
-    if _MIGRATION_SQL.exists():
-        return _MIGRATION_SQL.read_text(encoding="utf-8")
-    return _INLINE_SQL
+    if migration_path.exists():
+        return migration_path.read_text(encoding="utf-8")
+    return inline_fallback
 
 
 def ensure_pg_schema(conn: psycopg.Connection[Any]) -> None:
     """
-    Idempotently create all tables, indexes and the pgvector extension.
+    Idempotently apply all schema migrations in order.
 
-    This executes ``migrations/001_initial_schema.sql`` (or the embedded
-    inline copy) inside a single transaction.  All DDL statements use
-    ``IF NOT EXISTS`` / ``IF NOT EXISTS`` guards so the function is safe
+    Executes ``migrations/001_initial_schema.sql`` and
+    ``migrations/002_consolidation.sql`` (or their embedded inline copies).
+    All DDL statements use ``IF NOT EXISTS`` guards so the function is safe
     to call on every application startup.
 
     Args:
@@ -213,7 +260,10 @@ def ensure_pg_schema(conn: psycopg.Connection[Any]) -> None:
               autocommit, applies the schema, then restores the prior
               state.
     """
-    sql = _load_migration_sql()
+    migrations = [
+        (_MIGRATION_SQL, _INLINE_SQL),
+        (_MIGRATION_002_SQL, _INLINE_SQL_002),
+    ]
 
     # psycopg3: autocommit must be True to run CREATE EXTENSION / CREATE INDEX
     # CONCURRENTLY outside a transaction block.  We toggle it for the duration.
@@ -221,6 +271,8 @@ def ensure_pg_schema(conn: psycopg.Connection[Any]) -> None:
     try:
         conn.autocommit = True
         with conn.cursor() as cur:
-            cur.execute(sql)
+            for path, fallback in migrations:
+                sql = _load_migration_sql(path, fallback)
+                cur.execute(sql)
     finally:
         conn.autocommit = prior_autocommit

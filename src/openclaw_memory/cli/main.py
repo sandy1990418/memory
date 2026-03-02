@@ -378,6 +378,91 @@ def status(
 
 
 # ---------------------------------------------------------------------------
+# consolidate
+# ---------------------------------------------------------------------------
+
+
+def _get_memory_service(pg_dsn: str | None = None) -> Any:
+    """Create a MemoryService from env config for CLI commands."""
+    dsn = pg_dsn or os.environ.get("OPENCLAW_PG_DSN", "")
+    if not dsn:
+        raise typer.BadParameter(
+            "PostgreSQL DSN required. Set OPENCLAW_PG_DSN or pass --pg-dsn."
+        )
+    from ..embeddings import create_embedding_provider
+    from ..service import MemoryService
+
+    provider = create_embedding_provider(
+        os.environ.get("OPENCLAW_EMBEDDING_PROVIDER", "openai")
+    )
+    return MemoryService(
+        pg_dsn=dsn,
+        embedding_provider=provider,
+        enable_conflict_resolver=True,
+        enable_structured_distill=True,
+    )
+
+
+@app.command()
+def consolidate(
+    user_id: str | None = typer.Option(None, "--user-id", "-u", help="Consolidate specific user"),
+    batch_size: int = typer.Option(50, "--batch-size", "-b", help="Users per batch"),
+    pg_dsn: str | None = typer.Option(None, "--pg-dsn", help="PostgreSQL DSN", envvar="OPENCLAW_PG_DSN"),
+) -> None:
+    """Run sleep-time memory consolidation (merge, deduplicate, promote)."""
+    try:
+        svc = _get_memory_service(pg_dsn)
+    except Exception as exc:
+        err_console.print(f"[red]Failed to create service:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    try:
+        if user_id:
+            report = svc.consolidate(user_id)
+            console.print(f"[green]Consolidated[/green] user={user_id}")
+            console.print(
+                f"  scanned={report.memories_scanned} merged={report.memories_merged} "
+                f"deleted={report.memories_deleted} abstracted={report.memories_abstracted}"
+            )
+        else:
+            reports = svc.consolidate_all(batch_size=batch_size)
+            console.print(f"[green]Consolidated {len(reports)} users[/green]")
+            for r in reports:
+                console.print(
+                    f"  {r.user_id}: scanned={r.memories_scanned} merged={r.memories_merged} "
+                    f"deleted={r.memories_deleted} abstracted={r.memories_abstracted}"
+                )
+    except Exception as exc:
+        err_console.print(f"[red]Consolidation failed:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+
+# ---------------------------------------------------------------------------
+# flush-buffer
+# ---------------------------------------------------------------------------
+
+
+@app.command(name="flush-buffer")
+def flush_buffer(
+    user_id: str = typer.Argument(..., help="User ID whose buffer to flush"),
+    pg_dsn: str | None = typer.Option(None, "--pg-dsn", help="PostgreSQL DSN", envvar="OPENCLAW_PG_DSN"),
+) -> None:
+    """Force-flush the short-term buffer for a user and run memory extraction."""
+    try:
+        svc = _get_memory_service(pg_dsn)
+    except Exception as exc:
+        err_console.print(f"[red]Failed to create service:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    try:
+        result = svc.flush_buffer(user_id)
+        console.print(f"[green]Flushed[/green] user={user_id}: {json.dumps(result)}")
+    except Exception as exc:
+        err_console.print(f"[red]Flush failed:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+
+# ---------------------------------------------------------------------------
 # Entry
 # ---------------------------------------------------------------------------
 

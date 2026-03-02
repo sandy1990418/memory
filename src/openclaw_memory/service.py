@@ -24,6 +24,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from .answer_contract import AnswerPayload, generate_answer
+from .consolidation import ConsolidationReport, MemoryConsolidator
 from .embeddings import EmbeddingProvider
 from .extraction import ExtractedMemory, extract_memories
 from .hybrid import merge_hybrid_results
@@ -36,10 +37,17 @@ from .lightmem import (
 from .llm_rerank import llm_rerank
 from .mmr import MMRConfig, apply_mmr_to_hybrid_results
 from .pg_schema import get_pg_connection
-from .pg_search import pg_search_keyword, pg_search_vector
+from .pg_search import (
+    pg_get_memories_by_ids,
+    pg_get_timeline,
+    pg_search_compact,
+    pg_search_keyword,
+    pg_search_vector,
+)
 from .query_expansion import extract_keywords
+from .short_term_buffer import BufferConfig, ShortTermBuffer
 from .temporal_decay import TemporalDecayConfig, apply_temporal_decay_by_created_at
-from .types import MemorySearchResult
+from .types import MemoryContext, MemoryIndex, MemorySearchResult
 from .working_memory import DBWorkingMemory, WorkingMemory
 
 if TYPE_CHECKING:
@@ -156,6 +164,9 @@ class MemoryService:
         enable_conflict_resolver: bool = False,
         enable_answer_contract: bool = False,
         enable_lightmem: bool = False,
+        enable_short_term_buffer: bool = False,
+        buffer_config: BufferConfig | None = None,
+        consolidation_similarity_threshold: float = 0.90,
         pre_compress: bool | None = None,
         messages_use: str | None = None,
         topic_segment: bool | None = None,
@@ -228,6 +239,21 @@ class MemoryService:
             )
         else:
             self._db_working_memory = None
+
+        # Short-term buffer (LightMem Light2 stage)
+        self._enable_short_term_buffer = enable_short_term_buffer
+        if enable_short_term_buffer and pg_dsn:
+            self._short_term_buffer: ShortTermBuffer | None = ShortTermBuffer(
+                pg_dsn,
+                config=buffer_config or BufferConfig(),
+            )
+        else:
+            self._short_term_buffer = None
+
+        # Consolidation settings
+        self._consolidation_similarity_threshold = _safe_float(
+            consolidation_similarity_threshold, 0.90, 0.5, 1.0
+        )
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -326,14 +352,16 @@ class MemoryService:
         try:
             from .conflict_resolver import apply_resolution, resolve_conflict  # noqa: PLC0415
 
-            resolution = resolve_conflict(
-                conn, user_id, memory, self._embedding_provider
+            resolutions = resolve_conflict(
+                conn, user_id, memory, self._embedding_provider,
+                llm_fn=self._llm_fn,
             )
             value_for_embedding = memory.value or memory.content
             embedding = _coerce_pgvector_dims(
                 self._embedding_provider.embed_query(value_for_embedding)
             )
-            apply_resolution(conn, user_id, resolution, embedding=embedding)
+            for resolution in resolutions:
+                apply_resolution(conn, user_id, resolution, embedding=embedding)
         except Exception:
             # Resolver unavailable or schema not ready; keep write path functional.
             table = self._table_for_memory(memory)
@@ -706,6 +734,177 @@ class MemoryService:
         return [_result_dict_to_search_result(r) for r in final]
 
     # ------------------------------------------------------------------
+    # Tiered search (token-efficient)
+    # ------------------------------------------------------------------
+
+    def search_compact(
+        self,
+        user_id: str,
+        query: str,
+        *,
+        max_results: int = 20,
+    ) -> list[MemoryIndex]:
+        """
+        Tier 1: Lightweight search returning only index entries (~50 tokens each).
+
+        Use this to get an overview of matching memories before fetching full content.
+        """
+        query_vec = self._embedding_provider.embed_query(query)
+
+        conn = self._get_conn()
+        try:
+            rows = pg_search_compact(conn, user_id, query_vec, limit=max_results)
+        finally:
+            conn.close()
+
+        return [
+            MemoryIndex(
+                id=r["id"],
+                title=r["title"],
+                memory_type=r["memory_type"],
+                score=r["score"],
+                created_at=str(r["created_at"]) if r["created_at"] else "",
+                source=r["source"],
+            )
+            for r in rows
+        ]
+
+    def get_timeline(
+        self,
+        user_id: str,
+        memory_id: str,
+        *,
+        depth_before: int = 3,
+        depth_after: int = 3,
+    ) -> list[MemoryContext]:
+        """
+        Tier 2: Get temporal context around a memory (~200 tokens).
+
+        Returns the target memory with truncated content and neighbor summaries.
+        """
+        conn = self._get_conn()
+        try:
+            rows = pg_get_timeline(
+                conn, user_id, memory_id,
+                depth_before=depth_before, depth_after=depth_after,
+            )
+        finally:
+            conn.close()
+
+        return [
+            MemoryContext(
+                id=r["id"],
+                content=r["content"],
+                memory_type=r["memory_type"],
+                score=r["score"],
+                created_at=str(r["created_at"]) if r["created_at"] else "",
+                source=r["source"],
+                neighbors=r.get("neighbors", []),
+            )
+            for r in rows
+        ]
+
+    def get_memories_by_ids(
+        self,
+        memory_ids: list[str],
+    ) -> list[MemorySearchResult]:
+        """
+        Tier 3: Fetch full content for specific memory IDs.
+
+        Use after Tier 1/2 to get complete details for selected memories.
+        """
+        if not memory_ids:
+            return []
+
+        conn = self._get_conn()
+        try:
+            rows = pg_get_memories_by_ids(conn, memory_ids)
+        finally:
+            conn.close()
+
+        return [_result_dict_to_search_result(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Buffer management
+    # ------------------------------------------------------------------
+
+    def flush_buffer(self, user_id: str) -> dict[str, Any]:
+        """
+        Force-flush the short-term buffer and run extraction on buffered messages.
+
+        Returns a summary dict with counts, or ``{"flushed": 0}`` if buffer
+        is empty or not enabled.
+        """
+        if self._short_term_buffer is None:
+            return {"flushed": 0, "inserted": 0}
+
+        buffered = self._short_term_buffer.flush(user_id)
+        if not buffered:
+            return {"flushed": 0, "inserted": 0}
+
+        if self._llm_fn is None:
+            return {"flushed": len(buffered), "inserted": 0, "error": "llm_fn not configured"}
+
+        prepared = self._prepare_conversation_for_extract(buffered)
+        if not prepared:
+            return {"flushed": len(buffered), "inserted": 0}
+
+        memories = extract_memories(prepared, self._llm_fn)
+        if not self._is_structured_distill_enabled():
+            self._normalize_memories_for_basic_mode(memories)
+
+        inserted = 0
+        conn = self._get_conn()
+        try:
+            conn.autocommit = False
+            for mem in memories:
+                table = self._table_for_memory(mem)
+                self._store_memory(conn, user_id, mem, table=table)
+                inserted += 1
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+        return {"flushed": len(buffered), "inserted": inserted}
+
+    # ------------------------------------------------------------------
+    # Consolidation (sleep-time maintenance)
+    # ------------------------------------------------------------------
+
+    def consolidate(self, user_id: str) -> ConsolidationReport:
+        """
+        Run sleep-time consolidation for a single user.
+
+        Merges similar canonical memories, detects stale memories,
+        and promotes recurring episodic events to semantic facts.
+        Requires ``llm_fn`` to be configured.
+        """
+        consolidator = MemoryConsolidator(
+            self._pg_dsn,
+            self._embedding_provider,
+            self._llm_fn or (lambda _: "{}"),
+            similarity_threshold=self._consolidation_similarity_threshold,
+        )
+        return consolidator.consolidate(user_id)
+
+    def consolidate_all(self, *, batch_size: int = 50) -> list[ConsolidationReport]:
+        """
+        Batch consolidation for all users with active canonical memories.
+
+        Intended for background/cron execution.
+        """
+        consolidator = MemoryConsolidator(
+            self._pg_dsn,
+            self._embedding_provider,
+            self._llm_fn or (lambda _: "{}"),
+            similarity_threshold=self._consolidation_similarity_threshold,
+        )
+        return consolidator.consolidate_all(batch_size=batch_size)
+
+    # ------------------------------------------------------------------
     # Write path
     # ------------------------------------------------------------------
 
@@ -718,6 +917,9 @@ class MemoryService:
         """
         Full write pipeline: extract -> classify -> store.
 
+        When ``enable_short_term_buffer`` is active, messages are buffered
+        until a flush threshold is reached, reducing LLM extraction calls.
+
         Returns a summary dict with counts of stored memories.
         """
         if not conversation:
@@ -725,6 +927,16 @@ class MemoryService:
 
         if self._llm_fn is None:
             return {"inserted": 0, "skipped": 0, "error": "llm_fn not configured"}
+
+        # --- Short-term buffer path ---
+        if self._short_term_buffer is not None:
+            self._short_term_buffer.append(user_id, conversation, thread_id=thread_id)
+            if not self._short_term_buffer.should_flush(user_id):
+                return {"buffered": len(conversation), "inserted": 0, "skipped": 0}
+            # Flush: extract from the full buffered conversation
+            buffered = self._short_term_buffer.flush(user_id)
+            if buffered:
+                conversation = buffered
 
         prepared_conversation = self._prepare_conversation_for_extract(conversation)
         if not prepared_conversation:
@@ -785,9 +997,32 @@ class MemoryService:
 
         Depending on ``save_session_mode`` this stores either the raw conversation
         or a compact summary in episodic memory, then clears working memory.
+        Force-flushes the short-term buffer if active.
         """
         if not conversation:
             return
+
+        # Force-flush any buffered messages before saving
+        if self._short_term_buffer is not None:
+            buffered = self._short_term_buffer.flush(user_id)
+            if buffered and self._llm_fn is not None:
+                # Extract memories from buffered content before session close
+                prepared = self._prepare_conversation_for_extract(buffered)
+                if prepared:
+                    memories = extract_memories(prepared, self._llm_fn)
+                    if not self._is_structured_distill_enabled():
+                        self._normalize_memories_for_basic_mode(memories)
+                    conn = self._get_conn()
+                    try:
+                        conn.autocommit = False
+                        for mem in memories:
+                            table = self._table_for_memory(mem)
+                            self._store_memory(conn, user_id, mem, table=table)
+                        conn.commit()
+                    except Exception:
+                        conn.rollback()
+                    finally:
+                        conn.close()
 
         content = self._session_text_for_storage(conversation)
 
@@ -912,15 +1147,17 @@ class MemoryService:
                 memory = self._payload_to_memory(payload)
                 if not memory.content:
                     raise ValueError("empty queued memory payload")
-                resolution = resolve_conflict(
+                resolutions = resolve_conflict(
                     item_conn,
                     queue_user_id,
                     memory,
                     self._embedding_provider,
+                    llm_fn=self._llm_fn,
                 )
                 value = memory.value or memory.content
                 embedding = _coerce_pgvector_dims(self._embedding_provider.embed_query(value))
-                apply_resolution(item_conn, queue_user_id, resolution, embedding=embedding)
+                for resolution in resolutions:
+                    apply_resolution(item_conn, queue_user_id, resolution, embedding=embedding)
                 self._mark_queue_done(item_conn, queue_id)
                 item_conn.commit()
                 processed += 1

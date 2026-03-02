@@ -71,6 +71,31 @@ class MemoryChunk:
     hash: str
 
 
+@dataclass
+class MemoryIndex:
+    """Tier 1: Lightweight index entry (~50 tokens)."""
+
+    id: str
+    title: str  # First 80 chars of content or memory_key
+    memory_type: str  # preference/fact/decision/event
+    score: float
+    created_at: str
+    source: str  # episodic/semantic/canonical
+
+
+@dataclass
+class MemoryContext:
+    """Tier 2: Timeline context (~200 tokens)."""
+
+    id: str
+    content: str  # Truncated to ~500 chars
+    memory_type: str
+    score: float
+    created_at: str
+    source: str
+    neighbors: list[dict] = field(default_factory=list)  # Adjacent time memories
+
+
 @runtime_checkable
 class MemorySearchManagerProtocol(Protocol):
     def search(

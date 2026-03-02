@@ -14,9 +14,13 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+import math
+
 _TOKEN_RE = re.compile(r"[a-z0-9_]+", flags=re.IGNORECASE)
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?。！？])\s+")
 _WS_RE = re.compile(r"\s+")
+_KEYWORD_RE = re.compile(r"[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*|\"[^\"]+\"|'[^']+'")
+_ACK_PATTERNS = frozenset({"ok", "okay", "sure", "thanks", "thank you", "yes", "no", "yep", "nope", "got it", "k", "yea", "yeah", "alright"})
 
 _VALID_MESSAGES_USE = frozenset({"all", "user_only"})
 
@@ -70,24 +74,117 @@ def _jaccard(a: frozenset[str], b: frozenset[str]) -> float:
     return inter / union if union > 0 else 0.0
 
 
+def _extract_keywords(text: str) -> frozenset[str]:
+    """Extract capitalized phrases and quoted strings as keywords."""
+    return frozenset(m.strip("\"'").lower() for m in _KEYWORD_RE.findall(text) if len(m) > 1)
+
+
+def _keyword_overlap(a: frozenset[str], b: frozenset[str]) -> float:
+    """Compute overlap ratio between two keyword sets."""
+    if not a and not b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    union = len(a | b)
+    return inter / union if union else 0.0
+
+
+def _is_low_info_message(content: str) -> bool:
+    """Check if a message is a short acknowledgment with low information density."""
+    stripped = content.strip().rstrip(".!,").lower()
+    if len(content) < 20 and "?" not in content:
+        if stripped in _ACK_PATTERNS:
+            return True
+        # Also catch very short messages with no real content
+        words = _TOKEN_RE.findall(stripped)
+        if len(words) <= 2 and stripped in _ACK_PATTERNS:
+            return True
+    return False
+
+
+def _compute_sentence_scores(sentences: list[str]) -> list[float]:
+    """Score sentences by TF-IDF importance relative to the full text."""
+    if not sentences:
+        return []
+
+    # Build document frequency (how many sentences contain each term)
+    doc_freq: dict[str, int] = {}
+    sentence_tokens = []
+    for sent in sentences:
+        tokens = [t.lower() for t in _TOKEN_RE.findall(sent)]
+        sentence_tokens.append(tokens)
+        for term in set(tokens):
+            doc_freq[term] = doc_freq.get(term, 0) + 1
+
+    n_docs = len(sentences)
+    scores: list[float] = []
+    for tokens in sentence_tokens:
+        if not tokens:
+            scores.append(0.0)
+            continue
+        tf: dict[str, float] = {}
+        for t in tokens:
+            tf[t] = tf.get(t, 0) + 1
+        # Normalize TF by sentence length
+        for t in tf:
+            tf[t] /= len(tokens)
+        # TF-IDF score for the sentence
+        score = 0.0
+        for t, freq in tf.items():
+            idf = math.log((n_docs + 1) / (doc_freq.get(t, 0) + 1)) + 1
+            score += freq * idf
+        scores.append(score)
+    return scores
+
+
 def _compress_text(text: str, limit: int) -> str:
-    """Compress long text while keeping head/tail cues."""
+    """Compress long text using TF-IDF sentence scoring to preserve important content."""
     if limit <= 0:
         return ""
     txt = _normalize_text(text)
     if len(txt) <= limit:
         return txt
 
-    parts = [p.strip() for p in _SENTENCE_SPLIT_RE.split(txt) if p.strip()]
-    if len(parts) >= 3:
-        middle = parts[len(parts) // 2]
-        candidate = " ".join([parts[0], middle, parts[-1]])
-        if len(candidate) <= limit:
-            return candidate
+    sentences = [p.strip() for p in _SENTENCE_SPLIT_RE.split(txt) if p.strip()]
 
-    head = max(1, int(limit * 0.65))
-    tail = max(1, limit - head - 5)
-    return f"{txt[:head].rstrip()} ... {txt[-tail:].lstrip()}"
+    # For very short texts or single sentences, fall back to truncation
+    if len(sentences) <= 2:
+        head = max(1, int(limit * 0.65))
+        tail = max(1, limit - head - 5)
+        return f"{txt[:head].rstrip()} ... {txt[-tail:].lstrip()}"
+
+    # Score sentences by importance
+    scores = _compute_sentence_scores(sentences)
+
+    # Always keep first and last sentence (positional importance)
+    # Then fill remaining budget with highest-scored middle sentences
+    first = sentences[0]
+    last = sentences[-1]
+    base_len = len(first) + len(last) + 1  # +1 for space
+
+    if base_len > limit:
+        # Even first+last exceeds limit, truncate
+        head = max(1, int(limit * 0.65))
+        tail = max(1, limit - head - 5)
+        return f"{txt[:head].rstrip()} ... {txt[-tail:].lstrip()}"
+
+    remaining = limit - base_len
+    # Rank middle sentences by score
+    middle = [(i, sentences[i], scores[i]) for i in range(1, len(sentences) - 1)]
+    middle.sort(key=lambda x: x[2], reverse=True)
+
+    # Greedily add highest-scored sentences that fit
+    selected_indices = {0, len(sentences) - 1}
+    for idx, sent, _score in middle:
+        cost = len(sent) + 1  # +1 for space
+        if cost <= remaining:
+            selected_indices.add(idx)
+            remaining -= cost
+
+    # Reassemble in original order
+    result_parts = [sentences[i] for i in sorted(selected_indices)]
+    return " ".join(result_parts)
 
 
 def _select_messages(
@@ -103,6 +200,9 @@ def _select_messages(
         if not content:
             continue
         if mode == "user_only" and role not in {"user", "system"}:
+            continue
+        # Deprioritize short acknowledgments with low information density
+        if _is_low_info_message(content):
             continue
         selected.append({"role": role, "content": content})
     return selected
@@ -128,10 +228,19 @@ def _segment_messages(
     current_sig: frozenset[str] = frozenset()
     split_threshold = max(64, cfg.topic_token_threshold)
 
+    current_keywords: frozenset[str] = frozenset()
+
     for msg in messages:
         msg_sig = _signature(msg["content"])
         msg_tokens = estimate_tokens(msg["content"])
-        sim = _jaccard(current_sig, msg_sig) if current else 1.0
+        msg_keywords = _extract_keywords(msg["content"])
+
+        if current:
+            jaccard_sim = _jaccard(current_sig, msg_sig)
+            kw_sim = _keyword_overlap(current_keywords, msg_keywords)
+            sim = 0.6 * jaccard_sim + 0.4 * kw_sim
+        else:
+            sim = 1.0
 
         drift_split = (
             bool(current)
@@ -144,10 +253,12 @@ def _segment_messages(
             current = []
             current_tokens = 0
             current_sig = frozenset()
+            current_keywords = frozenset()
 
         current.append(msg)
         current_tokens += msg_tokens
         current_sig = current_sig | msg_sig
+        current_keywords = current_keywords | msg_keywords
 
     if current:
         segments.append(current)

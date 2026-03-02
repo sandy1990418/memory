@@ -209,6 +209,91 @@ LLM 回傳結構化 JSON：
 
 ---
 
+## 進階功能：四框架整合
+
+openclaw-memory 整合了四個記憶框架的核心優勢，按 pipeline 階段組合。
+
+### LLM-Based CRUD（取代規則式 Conflict Resolver）
+
+來源：Mem0 論文。當 `enable_conflict_resolver=True` 且提供了 `llm_fn`，系統自動使用 LLM 判斷新記憶與現有記憶的關係，決定 ADD/UPDATE/DELETE/NOOP：
+
+```python
+svc = MemoryService(
+    pg_dsn=dsn, embedding_provider=ep, llm_fn=my_llm,
+    enable_structured_distill=True,
+    enable_conflict_resolver=True,  # 啟用 LLM CRUD
+)
+```
+
+LLM 能理解語意衝突（「我喜歡咖啡」vs「我最近改喝茶了」），比規則式更準確。無 LLM 時自動退回規則式。
+
+### Short-Term Buffer（短期記憶緩衝）
+
+來源：LightMem Light2 階段。減少 LLM 萃取呼叫次數——累積到閾值才觸發一次萃取：
+
+```python
+from openclaw_memory.short_term_buffer import BufferConfig
+
+svc = MemoryService(
+    pg_dsn=dsn, embedding_provider=ep, llm_fn=my_llm,
+    enable_short_term_buffer=True,
+    buffer_config=BufferConfig(
+        flush_token_threshold=1500,   # 累積 token 數
+        flush_message_threshold=15,   # 或累積訊息數
+        max_age_seconds=3600,         # 或最大等待時間
+    ),
+)
+```
+
+`ingest_conversation()` 會先把訊息放進 buffer，滿足閾值時一次萃取全部。`save_session()` 會強制 flush。
+
+### Sleep-Time Consolidation（離線記憶整理）
+
+來源：LightMem Light3 階段。定期離線合併相似記憶、刪除過時記憶、將事件抽象為知識：
+
+```python
+# 單一使用者
+report = svc.consolidate("user-123")
+print(f"merged={report.memories_merged}, deleted={report.memories_deleted}")
+
+# 批次處理所有使用者（適合 cron job）
+reports = svc.consolidate_all(batch_size=50)
+```
+
+CLI 指令：
+```bash
+ocmem consolidate --user-id user-123
+ocmem consolidate --batch-size 50
+```
+
+### Three-Tier Search（三層 Token 節省檢索）
+
+來源：claude-mem 的 3-layer workflow。先取輕量索引，再按需取詳情，節省 token：
+
+```python
+# Tier 1: 輕量索引（~50 tokens/result）
+indices = svc.search_compact("user-123", "coffee preference", max_results=20)
+
+# Tier 2: 時間脈絡（~200 tokens/result）
+context = svc.get_timeline("user-123", indices[0].id, depth_before=3, depth_after=3)
+
+# Tier 3: 完整內容（按需取）
+full = svc.get_memories_by_ids([idx.id for idx in indices[:5]])
+```
+
+原有的 `search()` 方法不變，仍可一次取得完整結果。
+
+### Sensory Memory 改進
+
+LightMem 的壓縮演算法升級：
+- **TF-IDF 壓縮**：依句子重要性保留關鍵內容，取代簡單的 head/tail 截斷
+- **改進話題分段**：加入關鍵詞重疊（大寫短語、引號字串）提升分段準確性
+- **低資訊過濾**：自動跳過「ok」「thanks」等短回應
+
+透過 `enable_lightmem=True` 啟用。
+
+---
+
 ## 安裝與設定
 
 ### 1. 安裝 Python 套件
@@ -1075,11 +1160,38 @@ bash scripts/run_longmemeval_service.sh full
 - `OPENCLAW_PG_DSN`（預設 `postgresql://memuser:mempass@localhost:5433/memory`）
 - `LME_LIMIT`（預設 `48`）
 - `LME_DISTILL_BATCH`（預設 `8`）
+- `LME_WRITE_MODE`（預設 `distill`；可改 `raw`）
 - `LME_PREP_MODEL`（預設 `gpt-4o-mini`）
 - `LME_QA_MODEL`（預設 `gpt-5-mini`）
 - `LME_RESOLVER_MODE`（預設 `off`）
 - `LME_DRAIN_MODE`（預設 `never`）
 - `LME_SERVICE_WORKERS`（預設 `2`，平行 prepare worker 數）
+- `LME_FAST_MODE`（預設 `0`；`1` 會把 read 階段改成較快設定）
+
+注意：
+
+- `--service-workers` / `LME_SERVICE_WORKERS` 只會加速 `prepare-only`。
+- `read-answer-only` 的主要耗時在回答模型 + judge（尤其 `judge=longmemeval`）。
+
+最快速跑完整流程（48 題）：
+
+```bash
+LME_FAST_MODE=1 LME_SERVICE_WORKERS=4 bash scripts/run_longmemeval_service.sh full
+```
+
+若你優先追求 LongMemEval 分數（而非最省 token），建議改成 `raw`：
+
+```bash
+LME_WRITE_MODE=raw LME_FAST_MODE=1 LME_SERVICE_WORKERS=4 \
+  bash scripts/run_longmemeval_service.sh full
+```
+
+`raw` 會保留原始 session 文字，通常比 aggressive distill 更容易保住答案細節。
+
+`LME_FAST_MODE=1` 預設會：
+
+- `read` 模型改為 `gpt-4o-mini`（若你沒手動指定 `LME_QA_MODEL`）
+- `judge` 改為 `exact`（若你沒手動指定 `LME_JUDGE`）
 
 若覺得 `service + distill` 太慢，可先用：
 
@@ -1087,8 +1199,8 @@ bash scripts/run_longmemeval_service.sh full
 - `--service-workers 2~4`（平行跑 prepare，各題不用等上一題）
 - `--answer-model gpt-4o-mini`（prepare 階段更快）
 - `--service-resolver-mode off`（先關 resolver，等需要再開）
+- `--judge exact`（read 階段會快非常多）
 - `--reuse-service-ingest`（重跑時重用已寫入資料，避免每次重做 distill）
-- `--judge exact`（先關掉 LLM judge）
 - `--limit 6`（小樣本快速迭代）
 
 LongMemEval QA 指標解讀（重要）：
