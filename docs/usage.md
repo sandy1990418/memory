@@ -16,7 +16,8 @@
 8. [API 端點一覽](#api-端點一覽)
 9. [使用指南：如何跑起來](#使用指南如何跑起來)
 10. [使用指南：常見操作](#使用指南常見操作)
-11. [設定參數速查](#設定參數速查)
+11. [使用指南：LongMemEval Benchmark Service](#使用指南longmemeval-benchmark-service)
+12. [設定參數速查](#設定參數速查)
 
 ---
 
@@ -736,6 +737,72 @@ memory_id = svc.add_memory(conn, user_id="user_123", content="喜歡深色主題
 # RAG 問答
 answer = svc.answer(conn, user_id="user_123", query="使用者喜歡什麼主題？")
 print(answer.answer, answer.confidence)
+```
+
+---
+
+## 使用指南：LongMemEval Benchmark Service
+
+### 目標
+
+這一節針對 `scripts/run_longmemeval_service.sh` 的服務模式 benchmark。
+
+已將腳本預設值調整為品質優先組合，對應以下執行需求：
+
+- `LME_WRITE_MODE=distill`
+- `LME_DISTILL_BATCH=2`
+- `LME_RESOLVER_MODE=offline`
+- `LME_DRAIN_MODE=after_run`
+- `LME_SEARCH_K=30`
+- `LME_ANSWER_TOP_K=10`
+- `LME_JUDGE=longmemeval`
+- `LME_JUDGE_MODEL=gpt-4o-mini`
+
+因此你現在可直接跑：
+
+```bash
+bash scripts/run_longmemeval_service.sh full --force-reindex --no-reuse-service-ingest
+```
+
+### 什麼時候要加 `--force-reindex --no-reuse-service-ingest`
+
+- `--force-reindex`：強制重建每題資料，避免吃到舊 ingestion 結果。
+- `--no-reuse-service-ingest`：禁用既有資料重用，確保這次設定真的生效。
+
+建議在你調整以下參數時都加上這兩個旗標：
+
+- `LME_WRITE_MODE`
+- `LME_DISTILL_BATCH`
+- `LME_RESOLVER_MODE`
+- `LME_DRAIN_MODE`
+- embedding model 或 provider
+
+### 主要參數說明（這次關注的組合）
+
+| 參數 | 類型 | 預設值 | 作用 |
+|---|---|---|---|
+| `LME_WRITE_MODE` | 環境變數 | `distill` | ingest 寫入策略。`distill` 會走 LLM 抽取與衝突處理，通常精度高於 `raw`。 |
+| `LME_DISTILL_BATCH` | 環境變數 | `2` | 每次合併幾個 session 做一次 distill。越大越快但可能犧牲召回與精度。 |
+| `LME_RESOLVER_MODE` | 環境變數 | `offline` | 衝突解析模式。`offline` 代表寫入 queue，之後再處理。 |
+| `LME_DRAIN_MODE` | 環境變數 | `after_run` | queue 何時清空。`after_run` 在 prepare/read 完成後統一處理。 |
+| `LME_SEARCH_K` | 環境變數 | `30` | 檢索候選深度（先取多少筆候選）。通常越高召回越好，但成本增加。 |
+| `LME_ANSWER_TOP_K` | 環境變數 | `10` | 實際送進回答模型的 evidence 數量。太低會漏掉正確證據。 |
+| `LME_JUDGE` | 環境變數 | `longmemeval` | 評分器類型。`longmemeval` 對齊官方評分 prompt。 |
+| `LME_JUDGE_MODEL` | 環境變數 | `gpt-4o-mini` | judge 使用模型；`longmemeval` 僅支援 `gpt-4o*`。 |
+| `--force-reindex` | CLI 旗標 | 手動指定 | 每題重建 DB 記憶資料。適合變更配置後重新評估。 |
+| `--no-reuse-service-ingest` | CLI 旗標 | 手動指定 | 不沿用既有 prepared 資料，避免結果受舊資料污染。 |
+
+### 常用執行模式
+
+```bash
+# 1) 只做 prepare（先把資料準備好）
+bash scripts/run_longmemeval_service.sh prepare --force-reindex --no-reuse-service-ingest
+
+# 2) 只做 read + QA（重用已準備好的資料）
+bash scripts/run_longmemeval_service.sh read
+
+# 3) 全流程（prepare + read）
+bash scripts/run_longmemeval_service.sh full --force-reindex --no-reuse-service-ingest
 ```
 
 ---

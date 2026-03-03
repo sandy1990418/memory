@@ -12,13 +12,17 @@ CREATE EXTENSION IF NOT EXISTS vector;
 CREATE TABLE IF NOT EXISTS episodic_memories (
     id          UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id     TEXT        NOT NULL,
-    thread_id   TEXT,
+    session_id  TEXT,
     content     TEXT        NOT NULL,
     embedding   vector(1536),
     memory_type TEXT        NOT NULL,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     metadata    JSONB       NOT NULL DEFAULT '{}'
 );
+
+-- Backward compatibility: older DBs used thread_id instead of session_id.
+ALTER TABLE episodic_memories
+    ADD COLUMN IF NOT EXISTS session_id TEXT;
 
 ALTER TABLE episodic_memories
     ADD COLUMN IF NOT EXISTS tsv tsvector
@@ -95,13 +99,20 @@ CREATE INDEX IF NOT EXISTS idx_user_profiles_user_id
 CREATE TABLE IF NOT EXISTS working_messages (
     id          UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id     TEXT        NOT NULL,
+    session_id  TEXT,
     role        TEXT        NOT NULL,
     content     TEXT        NOT NULL,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+ALTER TABLE working_messages
+    ADD COLUMN IF NOT EXISTS session_id TEXT;
+
 CREATE INDEX IF NOT EXISTS idx_working_messages_user_created
     ON working_messages (user_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_working_messages_user_session
+    ON working_messages (user_id, session_id, created_at DESC);
 
 -- ---------------------------------------------------------------------------
 -- canonical_memories

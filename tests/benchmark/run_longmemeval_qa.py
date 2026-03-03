@@ -308,20 +308,34 @@ def _build_lme_evidence_files(instance: dict) -> list[dict[str, str]]:
     return evidence_files
 
 
-def _result_path(item: Any) -> str:
-    """Extract path from search result — supports both old and new MemorySearchResult."""
-    # Old SQLite-based result: has .path directly
-    if hasattr(item, "path"):
-        return str(item.path)
-    # New PG-based MemorySearchResult: path stored in metadata.source_path
+def _result_paths(item: Any) -> list[str]:
+    """Extract all source paths from a search result (handles batched source_paths)."""
+    paths: list[str] = []
+    if hasattr(item, "path") and item.path:
+        paths.append(str(item.path))
     if hasattr(item, "metadata"):
         meta = item.metadata if isinstance(item.metadata, dict) else {}
         sp = meta.get("source_path", "")
         if sp:
-            return str(sp)
+            paths.append(str(sp))
+        sps = meta.get("source_paths", [])
+        if isinstance(sps, list):
+            paths.extend(str(p) for p in sps if p)
     if isinstance(item, dict):
-        return str(item.get("path", "") or item.get("source_path", ""))
-    return ""
+        if item.get("path"):
+            paths.append(str(item["path"]))
+        if item.get("source_path"):
+            paths.append(str(item["source_path"]))
+        sps = item.get("source_paths", [])
+        if isinstance(sps, list):
+            paths.extend(str(p) for p in sps if p)
+    return paths
+
+
+def _result_path(item: Any) -> str:
+    """Extract first path from search result (backwards-compat helper)."""
+    paths = _result_paths(item)
+    return paths[0] if paths else ""
 
 
 def _result_start_line(item: Any) -> int:
@@ -362,8 +376,10 @@ def _result_snippet(item: Any) -> str:
 
 def _retrieval_hit_at_k(results: list[Any], evidence_files: list[dict], k: int = 5) -> float:
     evidence_fns = {ef["filename"] for ef in evidence_files}
-    paths = {_result_path(r).replace("\\", "/") for r in results[:k]}
-    hit = any(any(p.endswith(ef) for p in paths) for ef in evidence_fns)
+    all_paths: set[str] = set()
+    for r in results[:k]:
+        all_paths.update(p.replace("\\", "/") for p in _result_paths(r))
+    hit = any(any(p.endswith(ef) for p in all_paths) for ef in evidence_fns)
     return 1.0 if hit else 0.0
 
 
@@ -380,9 +396,11 @@ def _evidence_coverage_at_k(results: list[Any], evidence_files: list[dict], k: i
     if not evidence_fns:
         return {"any_hit": 1.0, "coverage": 1.0, "all_hit": 1.0}
 
-    paths = {_result_path(r).replace("\\", "/") for r in results[:k]}
+    all_paths: set[str] = set()
+    for r in results[:k]:
+        all_paths.update(p.replace("\\", "/") for p in _result_paths(r))
     matched: set[str] = set()
-    for p in paths:
+    for p in all_paths:
         for ef in evidence_fns:
             if p.endswith(ef):
                 matched.add(ef)
@@ -517,6 +535,29 @@ def _session_to_text(session: list[dict[str, Any]], session_id: str, date: str) 
     return "\n".join(lines)
 
 
+def _raw_embedding_text(
+    content: str,
+    *,
+    max_chars: int = 24000,
+) -> str:
+    """
+    Build embedding input for raw session rows.
+
+    Old behavior used only leading 4k chars, which can miss answer facts that
+    appear later in long sessions. This keeps full text when possible and falls
+    back to head/middle/tail sampling for very long sessions.
+    """
+    text = content.strip()
+    if len(text) <= max_chars:
+        return text
+    seg = max(1, max_chars // 3)
+    head = text[:seg]
+    mid_start = max(0, (len(text) // 2) - (seg // 2))
+    middle = text[mid_start: mid_start + seg]
+    tail = text[-seg:]
+    return "\n...\n".join((head, middle, tail))
+
+
 def _service_reset_user_data(pg_dsn: str, user_id: str) -> None:
     conn = get_pg_connection(pg_dsn)
     try:
@@ -527,6 +568,15 @@ def _service_reset_user_data(pg_dsn: str, user_id: str) -> None:
             cur.execute("DELETE FROM canonical_memories WHERE user_id = %s", (user_id,))
             cur.execute("DELETE FROM semantic_memories WHERE user_id = %s", (user_id,))
             cur.execute("DELETE FROM episodic_memories WHERE user_id = %s", (user_id,))
+            # Reset token budget so extraction is not throttled
+            cur.execute(
+                """
+                UPDATE user_profiles
+                SET tokens_used_today = 0, budget_reset_at = now()
+                WHERE user_id = %s
+                """,
+                (user_id,),
+            )
         conn.commit()
     except Exception:
         conn.rollback()
@@ -617,13 +667,57 @@ class _BenchmarkServiceAdapter:
         self._pg_dsn = pg_dsn
 
     def ingest_conversation(
-        self, user_id: str, session_id: str, conversation: list[dict[str, Any]]
+        self,
+        user_id: str,
+        session_id: str,
+        conversation: list[dict[str, Any]],
+        *,
+        source_paths: list[str] | None = None,
     ) -> dict[str, Any]:
         conn = get_pg_connection(self._pg_dsn)
         try:
             result = self._svc.ingest_conversation(
                 conn, user_id, conversation, session_id=session_id,
             )
+            # Stamp source_path on memories that were just created so the
+            # benchmark evidence-matching logic can trace them back to the
+            # originating session files.  For batched sessions we duplicate
+            # each memory row per source_path so the path-based matching can
+            # find the correct evidence session.
+            if source_paths:
+                with conn.cursor() as cur:
+                    if len(source_paths) == 1:
+                        # Single session — just tag existing rows.
+                        patch = json.dumps({"source_path": source_paths[0]})
+                        for table in ("episodic_memories", "semantic_memories", "canonical_memories"):
+                            cur.execute(
+                                f"""
+                                UPDATE {table}
+                                SET metadata = metadata || %s::jsonb
+                                WHERE user_id = %s
+                                  AND (metadata->>'source_path' IS NULL
+                                       OR metadata->>'source_path' = '')
+                                  AND created_at >= now() - interval '30 seconds'
+                                """,
+                                (patch, user_id),
+                            )
+                    else:
+                        # Batched sessions — tag every new row with all
+                        # source_paths as a JSON array so the matching
+                        # helper can check membership.
+                        patch = json.dumps({"source_paths": source_paths})
+                        for table in ("episodic_memories", "semantic_memories", "canonical_memories"):
+                            cur.execute(
+                                f"""
+                                UPDATE {table}
+                                SET metadata = metadata || %s::jsonb
+                                WHERE user_id = %s
+                                  AND metadata->>'source_path' IS NULL
+                                  AND metadata->>'source_paths' IS NULL
+                                  AND created_at >= now() - interval '30 seconds'
+                                """,
+                                (patch, user_id),
+                            )
             conn.commit()
             return result
         except Exception:
@@ -685,7 +779,8 @@ def _service_ingest_raw_sessions(
     content_rows: list[tuple[int, str, str, str, str]] = []
     for i, (sess, sid, date) in enumerate(zip(sessions, session_ids, dates)):
         content = _session_to_text(sess, str(sid), str(date))
-        content_rows.append((i, str(sid), str(date), content, content[:4000]))
+        emb_text = _raw_embedding_text(content)
+        content_rows.append((i, str(sid), str(date), content, emb_text))
 
     # Batch embeddings to reduce API round-trips significantly.
     embed_inputs = [row[4] for row in content_rows]
@@ -712,7 +807,7 @@ def _service_ingest_raw_sessions(
                 cur.execute(
                     """
                     INSERT INTO episodic_memories
-                    (user_id, thread_id, content, embedding, memory_type, metadata)
+                    (user_id, session_id, content, embedding, memory_type, metadata)
                     VALUES (%s, %s, %s, %s::vector, %s, %s::jsonb)
                     """,
                     (
@@ -847,19 +942,25 @@ def _service_ingest_distilled_sessions(
                 if not turns:
                     continue
                 sid = str(session_ids[i]) if i < len(session_ids) else f"s{i:04d}"
-                service.ingest_conversation(user_id, sid, turns)
+                sp = f"memory/session_{i:04d}.md"
+                service.ingest_conversation(user_id, sid, turns, source_paths=[sp])
             return
 
         batch_idx = 0
         for i in range(0, len(sessions), batch_n):
             merged: list[dict[str, str]] = []
+            batch_source_paths: list[str] = []
             if batch_system_prompt.strip():
                 merged.append({"role": "system", "content": batch_system_prompt})
-            for sess in sessions[i:i + batch_n]:
+            for j, sess in enumerate(sessions[i:i + batch_n]):
                 merged.extend(_session_turns(sess))
+                batch_source_paths.append(f"memory/session_{i + j:04d}.md")
             if not merged:
                 continue
-            service.ingest_conversation(user_id, f"batch_{batch_idx:04d}", merged)
+            service.ingest_conversation(
+                user_id, f"batch_{batch_idx:04d}", merged,
+                source_paths=batch_source_paths,
+            )
             batch_idx += 1
         return
 
@@ -870,10 +971,12 @@ def _service_ingest_distilled_sessions(
             conversation = _session_to_conversation(sess, sid, date)
             if len(conversation) <= 1:
                 continue
-            service.ingest_conversation(user_id, sid, conversation)
+            sp = f"memory/session_{i:04d}.md"
+            service.ingest_conversation(user_id, sid, conversation, source_paths=[sp])
         return
 
     merged: list[dict[str, str]] = []
+    batch_source_paths: list[str] = []
     batch_idx = 0
     in_batch = 0
     for i, sess in enumerate(sessions):
@@ -886,15 +989,23 @@ def _service_ingest_distilled_sessions(
             }
         )
         merged.extend(_session_turns(sess))
+        batch_source_paths.append(f"memory/session_{i:04d}.md")
         in_batch += 1
         if in_batch >= batch_n:
             if len(merged) > 1:
-                service.ingest_conversation(user_id, f"batch_{batch_idx:04d}", merged)
+                service.ingest_conversation(
+                    user_id, f"batch_{batch_idx:04d}", merged,
+                    source_paths=batch_source_paths,
+                )
             merged = []
+            batch_source_paths = []
             in_batch = 0
             batch_idx += 1
     if len(merged) > 1:
-        service.ingest_conversation(user_id, f"batch_{batch_idx:04d}", merged)
+        service.ingest_conversation(
+            user_id, f"batch_{batch_idx:04d}", merged,
+            source_paths=batch_source_paths,
+        )
 
 
 def _prepare_service_instance(
@@ -1206,6 +1317,12 @@ def run_longmemeval_qa(
     reuse_service_ingest: bool,
     read_answer_only: bool,
 ) -> dict[str, Any]:
+    if pipeline == "manager":
+        raise ValueError(
+            "pipeline=manager is no longer supported (MemoryIndexManager was removed). "
+            "Use --pipeline service with --pg-dsn or OPENCLAW_PG_DSN."
+        )
+
     config_ov = CONFIG_MATRIX.get(config_name, CONFIG_MATRIX["hybrid"])
     use_provider = config_name != "fts_only" or pipeline == "service"
     answer_k = max(1, max(max_results, answer_top_k))
@@ -1814,8 +1931,11 @@ def main() -> None:
     parser.add_argument(
         "--pipeline",
         choices=["manager", "service"],
-        default="manager",
-        help="Execution pipeline: manager(SQLite) or service(PostgreSQL MemoryService)",
+        default="service",
+        help=(
+            "Execution pipeline. service(PostgreSQL MemoryService) is supported; "
+            "manager is legacy and no longer available."
+        ),
     )
     parser.add_argument(
         "--pg-dsn",
@@ -1998,6 +2118,13 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if args.pipeline == "manager":
+        raise SystemExit(
+            "ERROR: --pipeline manager is no longer supported "
+            "(MemoryIndexManager was removed). "
+            "Use --pipeline service with --pg-dsn or OPENCLAW_PG_DSN."
+        )
+
     _load_dotenv()
     if args.distill_batch_sessions < 1:
         raise SystemExit("--distill-batch-sessions must be >= 1")
@@ -2056,11 +2183,20 @@ def main() -> None:
         if not pg_dsn:
             print("ERROR: --pipeline service requires --pg-dsn or OPENCLAW_PG_DSN.")
             sys.exit(1)
-        conn = get_pg_connection(pg_dsn)
         try:
-            ensure_pg_schema(conn)
-        finally:
-            conn.close()
+            conn = get_pg_connection(pg_dsn)
+            try:
+                ensure_pg_schema(conn)
+            finally:
+                conn.close()
+        except Exception as exc:
+            print(
+                "ERROR: Failed to connect PostgreSQL or initialize schema. "
+                "Check --pg-dsn / OPENCLAW_PG_DSN.",
+                flush=True,
+            )
+            print(f"DETAIL: {exc}", flush=True)
+            sys.exit(1)
         if args.service_write_mode == "distill":
             print(
                 "Service distill config: "
