@@ -87,3 +87,72 @@ CREATE TABLE IF NOT EXISTS user_profiles (
 -- B-tree index on user_id (already the PK, but explicit for consistency)
 CREATE INDEX IF NOT EXISTS idx_user_profiles_user_id
     ON user_profiles (user_id);
+
+-- ---------------------------------------------------------------------------
+-- working_messages
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS working_messages (
+    id          UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id     TEXT        NOT NULL,
+    role        TEXT        NOT NULL,
+    content     TEXT        NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_working_messages_user_created
+    ON working_messages (user_id, created_at DESC);
+
+-- ---------------------------------------------------------------------------
+-- canonical_memories
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS canonical_memories (
+    id                    UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id               TEXT        NOT NULL,
+    memory_key            TEXT        NOT NULL,
+    value                 TEXT        NOT NULL,
+    memory_type           TEXT        NOT NULL,
+    confidence            FLOAT       NOT NULL DEFAULT 0.8,
+    event_time            TIMESTAMPTZ,
+    status                TEXT        NOT NULL DEFAULT 'active',
+    supersedes_memory_id  UUID        REFERENCES canonical_memories(id),
+    embedding             vector(1536),
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    metadata              JSONB       NOT NULL DEFAULT '{}'
+);
+
+-- Unique active key per user
+CREATE UNIQUE INDEX IF NOT EXISTS idx_canonical_active_key
+    ON canonical_memories (user_id, memory_key) WHERE status = 'active';
+
+-- User lookup
+CREATE INDEX IF NOT EXISTS idx_canonical_user_id
+    ON canonical_memories (user_id);
+
+-- HNSW for similarity fallback
+CREATE INDEX IF NOT EXISTS idx_canonical_embedding_hnsw
+    ON canonical_memories USING hnsw (embedding vector_cosine_ops);
+
+-- ---------------------------------------------------------------------------
+-- memory_update_queue (sleep-time / offline canonical updates)
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS memory_update_queue (
+    id            BIGSERIAL   PRIMARY KEY,
+    user_id       TEXT        NOT NULL,
+    payload       JSONB       NOT NULL,
+    status        TEXT        NOT NULL DEFAULT 'pending',
+    attempts      INTEGER     NOT NULL DEFAULT 0,
+    last_error    TEXT,
+    available_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_update_queue_status_time
+    ON memory_update_queue (status, available_at);
+
+CREATE INDEX IF NOT EXISTS idx_memory_update_queue_user_status
+    ON memory_update_queue (user_id, status);

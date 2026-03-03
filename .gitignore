@@ -21,7 +21,7 @@ tests/benchmark/corpus
 tests/benchmark/data
 tests/benchmark/tests
 .venv/
-migrations/
+# migrations/
 logs
 locomo_fts.json
 locomo_mock.json
