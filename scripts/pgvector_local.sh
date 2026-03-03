@@ -36,9 +36,10 @@ case "${cmd}" in
     ;;
   init)
     PYTHONPATH="${REPO_ROOT}/src:${PYTHONPATH:-}" \
-      python -c "from openclaw_memory.pg_schema import get_pg_connection, ensure_pg_schema; \
-conn = get_pg_connection('${PG_DSN}'); \
-ensure_pg_schema(conn); \
+      python -c "from openclaw_memory.db.connection import get_sync_connection; \
+from openclaw_memory.db.schema import ensure_schema; \
+conn = get_sync_connection('${PG_DSN}'); \
+ensure_schema(conn); \
 conn.close(); \
 print('schema ready')"
     ;;

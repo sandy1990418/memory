@@ -40,12 +40,20 @@ sys.path.insert(0, str(Path(__file__).parents[2] / "src"))
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
 from helpers.embeddings_mock import MockEmbeddingProvider  # noqa: E402
-from openclaw_memory.answer_contract import generate_answer  # noqa: E402
-from openclaw_memory.config import resolve_memory_search_config  # noqa: E402
-from openclaw_memory.embeddings import OpenAIEmbeddingProvider  # noqa: E402
-from openclaw_memory.manager import MemoryIndexManager  # noqa: E402
-from openclaw_memory.pg_schema import ensure_pg_schema, get_pg_connection  # noqa: E402
-from openclaw_memory.service import MemoryService  # noqa: E402
+from openclaw_memory.pipeline.retrieval.answer import generate_answer  # noqa: E402
+from openclaw_memory.config import AppSettings  # noqa: E402
+from openclaw_memory.core.embeddings import OpenAIEmbeddingProvider  # noqa: E402
+from openclaw_memory.db.schema import ensure_schema as ensure_pg_schema  # noqa: E402
+from openclaw_memory.db.connection import get_sync_connection as get_pg_connection  # noqa: E402
+from openclaw_memory.core.service import MemoryService  # noqa: E402
+
+# Shim: MemoryIndexManager no longer exists (architecture moved to PG-only).
+# The manager pipeline path is disabled — use --pipeline service instead.
+MemoryIndexManager = None  # type: ignore[assignment,misc]
+
+def resolve_memory_search_config(**_kw: Any) -> Any:  # noqa: E302
+    """No-op shim — manager pipeline is removed."""
+    return None
 from run_real_embedding_benchmark import (  # noqa: E402
     CONFIG_MATRIX,
     LONGMEMEVAL_FILE,
@@ -301,10 +309,18 @@ def _build_lme_evidence_files(instance: dict) -> list[dict[str, str]]:
 
 
 def _result_path(item: Any) -> str:
+    """Extract path from search result — supports both old and new MemorySearchResult."""
+    # Old SQLite-based result: has .path directly
     if hasattr(item, "path"):
         return str(item.path)
+    # New PG-based MemorySearchResult: path stored in metadata.source_path
+    if hasattr(item, "metadata"):
+        meta = item.metadata if isinstance(item.metadata, dict) else {}
+        sp = meta.get("source_path", "")
+        if sp:
+            return str(sp)
     if isinstance(item, dict):
-        return str(item.get("path", ""))
+        return str(item.get("path", "") or item.get("source_path", ""))
     return ""
 
 
@@ -333,10 +349,14 @@ def _result_score(item: Any) -> float:
 
 
 def _result_snippet(item: Any) -> str:
+    """Extract text snippet — supports both old (.snippet) and new (.content) results."""
     if hasattr(item, "snippet"):
         return str(item.snippet or "")
+    # New PG-based MemorySearchResult uses .content
+    if hasattr(item, "content"):
+        return str(item.content or "")
     if isinstance(item, dict):
-        return str(item.get("snippet", "") or "")
+        return str(item.get("snippet", "") or item.get("content", "") or "")
     return ""
 
 
@@ -586,6 +606,54 @@ def _service_user_id_for_instance(
     return f"lmeqa_{provider_label}_{mode_suffix}_{qid}".replace("/", "_")
 
 
+class _BenchmarkServiceAdapter:
+    """
+    Wraps the new MemoryService (which requires conn per call) into the old
+    benchmark-compatible interface where pg_dsn was stored internally.
+    """
+
+    def __init__(self, svc: MemoryService, pg_dsn: str) -> None:
+        self._svc = svc
+        self._pg_dsn = pg_dsn
+
+    def ingest_conversation(
+        self, user_id: str, session_id: str, conversation: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        conn = get_pg_connection(self._pg_dsn)
+        try:
+            result = self._svc.ingest_conversation(
+                conn, user_id, conversation, session_id=session_id,
+            )
+            conn.commit()
+            return result
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def search(
+        self, user_id: str, query: str, **kwargs: Any
+    ) -> list[Any]:
+        # Translate old kwargs to new API
+        top_k = kwargs.pop("max_results", None) or kwargs.pop("top_k", None)
+        # Discard kwargs not supported by new MemoryService.search
+        kwargs.pop("include_working_memory", None)
+        kwargs.pop("enable_llm_rerank", None)
+        kwargs.pop("vector_weight", None)
+        kwargs.pop("text_weight", None)
+        kwargs.pop("mmr_config", None)
+        conn = get_pg_connection(self._pg_dsn)
+        try:
+            return self._svc.search(conn, user_id, query, top_k=top_k, **kwargs)
+        finally:
+            conn.close()
+
+    def drain_update_queue(self, **kwargs: Any) -> dict[str, int] | None:
+        # drain_update_queue doesn't exist in the new MemoryService — no-op
+        return None
+
+
 def _build_memory_service(
     *,
     pg_dsn: str,
@@ -594,23 +662,14 @@ def _build_memory_service(
     service_write_mode: str,
     service_lightmem: bool,
     service_resolver_mode: str,
-) -> MemoryService:
-    distill_mode = service_write_mode == "distill"
-    resolver_mode = _normalize_service_resolver_mode(service_resolver_mode, service_write_mode)
-    enable_resolver = distill_mode and resolver_mode != "off"
-    resolver_update_mode = resolver_mode if resolver_mode in ("offline", "sync") else "offline"
-    enable_lightmem = distill_mode and service_lightmem
-
-    return MemoryService(
-        pg_dsn=pg_dsn,
+) -> _BenchmarkServiceAdapter:
+    settings = AppSettings()
+    svc = MemoryService(
         embedding_provider=provider,
+        settings=settings,
         llm_fn=llm_fn,
-        enable_structured_distill=distill_mode,
-        enable_conflict_resolver=enable_resolver,
-        enable_answer_contract=True,
-        enable_lightmem=enable_lightmem,
-        resolver_update_mode=resolver_update_mode,
     )
+    return _BenchmarkServiceAdapter(svc, pg_dsn)
 
 
 def _service_ingest_raw_sessions(
@@ -1180,7 +1239,7 @@ def run_longmemeval_qa(
             raise ValueError("service pipeline requires an embedding provider")
         if not pg_dsn:
             raise ValueError("service pipeline requires --pg-dsn or OPENCLAW_PG_DSN")
-        from openclaw_memory.mmr import MMRConfig  # noqa: PLC0415
+        from openclaw_memory.pipeline.retrieval.ranking import MMRConfig  # noqa: PLC0415
 
         if config_name == "fts_only":
             vector_weight, text_weight = 0.0, 1.0

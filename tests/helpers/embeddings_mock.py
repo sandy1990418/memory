@@ -2,20 +2,46 @@
 Mock embedding provider for tests.
 Produces deterministic, low-dimensional vectors based on word frequency.
 """
+
 from __future__ import annotations
 
 import math
 
-
 # Vocabulary used for deterministic embeddings (alpha-side vs beta-side)
-_ALPHA_WORDS = frozenset([
-    "memory", "index", "chunk", "search", "file", "hash", "embed",
-    "vector", "cosine", "similarity", "query", "result", "path",
-])
-_BETA_WORDS = frozenset([
-    "session", "daily", "note", "decision", "cli", "sync", "dirty",
-    "manager", "status", "provider", "model", "database", "sqlite",
-])
+_ALPHA_WORDS = frozenset(
+    [
+        "memory",
+        "index",
+        "chunk",
+        "search",
+        "file",
+        "hash",
+        "embed",
+        "vector",
+        "cosine",
+        "similarity",
+        "query",
+        "result",
+        "path",
+    ]
+)
+_BETA_WORDS = frozenset(
+    [
+        "session",
+        "daily",
+        "note",
+        "decision",
+        "cli",
+        "sync",
+        "dirty",
+        "manager",
+        "status",
+        "provider",
+        "model",
+        "database",
+        "sqlite",
+    ]
+)
 
 # Dimension of mock embeddings
 MOCK_DIMS = 16
@@ -35,10 +61,10 @@ def _make_vector(text: str) -> list[float]:
     for word in words:
         char_sum = sum(ord(c) for c in word)
         if word in _ALPHA_WORDS:
-            slot = char_sum % 8            # dims 0-7
+            slot = char_sum % 8  # dims 0-7
             vec[slot] += 1.0
         elif word in _BETA_WORDS:
-            slot = 8 + (char_sum % 8)     # dims 8-15
+            slot = 8 + (char_sum % 8)  # dims 8-15
             vec[slot] += 1.0
         else:
             # Generic: spread across all dims by hash
@@ -60,6 +86,8 @@ class MockEmbeddingProvider:
 
     Attributes
     ----------
+    embed_query_calls:
+        Tracks every text passed to embed_query, for assertion.
     embed_batch_calls:
         Tracks every list of texts passed to embed_batch, for assertion.
     """
@@ -68,11 +96,20 @@ class MockEmbeddingProvider:
     model: str = "mock-v1"
 
     def __init__(self) -> None:
+        self.embed_query_calls: list[str] = []
         self.embed_batch_calls: list[list[str]] = []
 
+    @property
+    def total_embed_calls(self) -> int:
+        """Total number of embedding calls (query + batch combined)."""
+        return len(self.embed_query_calls) + sum(len(b) for b in self.embed_batch_calls)
+
     def embed_query(self, text: str) -> list[float]:
+        self.embed_query_calls.append(text)
         return _make_vector(text)
 
     def embed_batch(self, texts: list[str]) -> list[list[float]]:
         self.embed_batch_calls.append(list(texts))
-        return [_make_vector(t) for t in texts]
+        # Keep per-item call accounting compatible with tests that assert
+        # embed_query call counts across sync cycles.
+        return [self.embed_query(t) for t in texts]
