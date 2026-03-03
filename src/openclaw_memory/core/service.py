@@ -51,22 +51,31 @@ class MemoryService:
     are always active.
     """
 
+    # Operations that can each use a different LLM.
+    LLM_OPERATIONS = (
+        "extraction", "conflict", "rerank", "answer", "consolidation", "promotion",
+    )
+
     def __init__(
         self,
         embedding_provider: EmbeddingProvider,
         settings: AppSettings,
         llm_fn: Callable[[str], str] | None = None,
         *,
-        extraction_llm_fn: Callable[[str], str] | None = None,
-        answer_llm_fn: Callable[[str], str] | None = None,
+        llm_fns: dict[str, Callable[[str], str]] | None = None,
     ) -> None:
         self._emb = embedding_provider
         self._settings = settings
-        # Dual-LLM: separate functions for extraction vs answer generation.
-        # Falls back to the single llm_fn if specific ones not provided.
-        self._extraction_llm_fn = extraction_llm_fn or llm_fn
-        self._answer_llm_fn = answer_llm_fn or llm_fn
+        # Per-operation LLM callables. Each key is an operation name
+        # (extraction, conflict, rerank, answer, consolidation, promotion).
+        # Falls back to the default llm_fn if a specific one is not provided.
+        self._default_llm_fn = llm_fn
+        self._llm_fns: dict[str, Callable[[str], str]] = dict(llm_fns or {})
         self._working = WorkingMemory(max_messages=settings.working_memory_max_messages)
+
+    def _get_llm(self, operation: str) -> Callable[[str], str] | None:
+        """Get the LLM callable for a specific operation, falling back to default."""
+        return self._llm_fns.get(operation) or self._default_llm_fn
 
     @property
     def sensory_config(self) -> SensoryConfig:
@@ -214,7 +223,7 @@ class MemoryService:
             text_weight=self._settings.search_text_weight,
             temporal_decay=self.temporal_decay_config,
             mmr=self.mmr_config,
-            llm_fn=self._answer_llm_fn,
+            llm_fn=self._get_llm("rerank"),
             top_k=max_results,
         )
 
@@ -284,7 +293,7 @@ class MemoryService:
         session_id: str | None = None,
     ) -> AnswerPayload:
         """Search + LLM answer generation with structured evidence."""
-        if self._answer_llm_fn is None:
+        if self._get_llm("answer") is None:
             return AnswerPayload(
                 answer="", evidence=[], confidence=0.0,
                 abstain=True, abstain_reason="LLM not configured",
@@ -311,7 +320,7 @@ class MemoryService:
             {"id": r.id, "snippet": r.content, "score": r.score}
             for r in results
         ]
-        tracker = self._tracked_answer_llm("answer")
+        tracker = self._tracked_llm("answer")
         result = generate_answer(query, evidence_chunks, tracker)
         self._record_usage(conn, user_id, tracker)
         return result
@@ -356,19 +365,15 @@ class MemoryService:
         if tracker.total_tokens > 0:
             queries.record_token_usage(conn, user_id, tracker.total_tokens)
 
-    def _tracked_extraction_llm(self, operation: str = "extraction") -> TokenTracker | None:
-        """Return a TokenTracker wrapping the extraction LLM."""
-        if self._extraction_llm_fn is None:
+    def _tracked_llm(self, operation: str) -> TokenTracker | None:
+        """Return a TokenTracker wrapping the LLM for the given operation."""
+        llm_fn = self._get_llm(operation)
+        if llm_fn is None:
             return None
-        model = self._settings.extraction_llm_model or self._settings.llm_model
-        return TokenTracker(self._extraction_llm_fn, model=model, operation=operation)
-
-    def _tracked_answer_llm(self, operation: str = "answer") -> TokenTracker | None:
-        """Return a TokenTracker wrapping the answer/retrieval LLM."""
-        if self._answer_llm_fn is None:
-            return None
-        model = self._settings.answer_llm_model or self._settings.llm_model
-        return TokenTracker(self._answer_llm_fn, model=model, operation=operation)
+        # Resolve per-operation model name from settings
+        model_attr = f"{operation}_llm_model"
+        model = getattr(self._settings, model_attr, "") or self._settings.llm_model
+        return TokenTracker(llm_fn, model=model, operation=operation)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -383,7 +388,7 @@ class MemoryService:
         session_id: str | None = None,
     ) -> dict[str, Any]:
         """Core ingest pipeline: sensory -> extract -> conflict resolve -> store."""
-        if not conversation or self._extraction_llm_fn is None:
+        if not conversation or self._get_llm("extraction") is None:
             return {"extracted": 0, "stored": 0, "skipped": 0}
 
         # Budget check — skip LLM steps if over budget
@@ -397,14 +402,14 @@ class MemoryService:
             return {"extracted": 0, "stored": 0, "skipped": len(conversation)}
 
         # Stage 2: LLM extraction (tracked)
-        tracker = self._tracked_extraction_llm("extraction")
+        tracker = self._tracked_llm("extraction")
         memories = extract_memories(prepared, tracker)
         if not memories:
             self._record_usage(conn, user_id, tracker)
             return {"extracted": 0, "stored": 0, "skipped": 0}
 
         # Stage 3: Conflict resolution + storage (tracked)
-        conflict_tracker = tracker.with_operation("conflict")
+        conflict_tracker = self._tracked_llm("conflict") or tracker.with_operation("conflict")
         min_conf = self._settings.extraction_min_confidence
         stored = 0
         skipped = 0
@@ -434,7 +439,7 @@ class MemoryService:
         try:
             resolutions = resolve_conflict(
                 conn, user_id, memory, self._emb,
-                llm_fn=llm_fn or self._extraction_llm_fn,
+                llm_fn=llm_fn or self._get_llm("conflict"),
             )
             embedding = coerce_pgvector_dims(
                 self._emb.embed_query(memory.value or memory.content)

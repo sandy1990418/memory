@@ -35,26 +35,21 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         ensure_schema(conn)
 
     # Create LLM client(s)
+    # Default LLM (used as fallback for any operation without a specific model)
     llm_fn = create_llm_client(provider=settings.llm_provider, model=settings.llm_model)
 
-    extraction_llm_fn = None
-    answer_llm_fn = None
-    if settings.extraction_llm_model:
-        extraction_llm_fn = create_llm_client(
-            provider=settings.llm_provider, model=settings.extraction_llm_model
-        )
-    if settings.answer_llm_model:
-        answer_llm_fn = create_llm_client(
-            provider=settings.llm_provider, model=settings.answer_llm_model
-        )
+    # Per-operation LLM overrides: only create a separate client when a
+    # per-operation model is explicitly configured in settings.
+    llm_fns: dict[str, object] = {}
+    for op in ("extraction", "conflict", "rerank", "answer", "consolidation", "promotion"):
+        model = getattr(settings, f"{op}_llm_model", "")
+        if model:
+            client = create_llm_client(provider=settings.llm_provider, model=model)
+            if client is not None:
+                llm_fns[op] = client
 
     # Initialize services with LLM
-    init_services(
-        settings,
-        llm_fn=llm_fn,
-        extraction_llm_fn=extraction_llm_fn,
-        answer_llm_fn=answer_llm_fn,
-    )
+    init_services(settings, llm_fn=llm_fn, llm_fns=llm_fns or None)
 
     yield
 

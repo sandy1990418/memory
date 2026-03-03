@@ -35,21 +35,40 @@ class AppSettings(BaseSettings):
     )
 
     # -- LLM --
+    # Each operation can use a different LLM model. If a per-operation model
+    # is empty, it falls back to llm_model. Set via env vars like
+    # OPENCLAW_EXTRACTION_LLM_MODEL, OPENCLAW_ANSWER_LLM_MODEL, etc.
     llm_provider: str = Field(
         default="auto",
         description="LLM provider: auto / openai / anthropic / gemini",
     )
     llm_model: str = Field(
         default="gpt-4o-mini",
-        description="Default LLM model (used as fallback if specific models not set)",
+        description="Default LLM model (fallback for all operations)",
     )
     extraction_llm_model: str = Field(
         default="",
-        description="LLM model for extraction and conflict resolution (defaults to llm_model)",
+        description="LLM model for fact extraction",
+    )
+    conflict_llm_model: str = Field(
+        default="",
+        description="LLM model for conflict resolution",
+    )
+    rerank_llm_model: str = Field(
+        default="",
+        description="LLM model for search re-ranking",
     )
     answer_llm_model: str = Field(
         default="",
-        description="LLM model for answer generation and re-ranking (defaults to llm_model)",
+        description="LLM model for answer generation",
+    )
+    consolidation_llm_model: str = Field(
+        default="",
+        description="LLM model for memory consolidation",
+    )
+    promotion_llm_model: str = Field(
+        default="",
+        description="LLM model for episodic-to-semantic promotion",
     )
 
     # -- Sensory pipeline (LightMem Stage 1) --

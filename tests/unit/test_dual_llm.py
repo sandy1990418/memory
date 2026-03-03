@@ -1,8 +1,7 @@
-"""Tests for dual-LLM support in MemoryService."""
+"""Tests for per-operation LLM support in MemoryService."""
 
-import json
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 from openclaw_memory.config import AppSettings
 from openclaw_memory.core.service import MemoryService
@@ -15,66 +14,69 @@ def _make_mock_emb():
     return emb
 
 
-class TestDualLLMInit(unittest.TestCase):
-    """Test that MemoryService correctly assigns separate LLM functions."""
+class TestPerOperationLLMInit(unittest.TestCase):
+    """Test that MemoryService correctly assigns per-operation LLM functions."""
 
-    def test_single_llm_fn_used_for_both(self):
+    def test_single_llm_fn_used_as_default(self):
         fn = MagicMock()
         svc = MemoryService(
             embedding_provider=_make_mock_emb(),
             settings=AppSettings(),
             llm_fn=fn,
         )
-        self.assertIs(svc._extraction_llm_fn, fn)
-        self.assertIs(svc._answer_llm_fn, fn)
+        # All operations fall back to the default
+        for op in MemoryService.LLM_OPERATIONS:
+            self.assertIs(svc._get_llm(op), fn)
 
-    def test_separate_llm_fns(self):
+    def test_per_operation_overrides(self):
+        default_fn = MagicMock(name="default")
         extract_fn = MagicMock(name="extract")
         answer_fn = MagicMock(name="answer")
         svc = MemoryService(
             embedding_provider=_make_mock_emb(),
             settings=AppSettings(),
-            extraction_llm_fn=extract_fn,
-            answer_llm_fn=answer_fn,
+            llm_fn=default_fn,
+            llm_fns={"extraction": extract_fn, "answer": answer_fn},
         )
-        self.assertIs(svc._extraction_llm_fn, extract_fn)
-        self.assertIs(svc._answer_llm_fn, answer_fn)
+        self.assertIs(svc._get_llm("extraction"), extract_fn)
+        self.assertIs(svc._get_llm("answer"), answer_fn)
+        # Others fall back to default
+        self.assertIs(svc._get_llm("conflict"), default_fn)
+        self.assertIs(svc._get_llm("rerank"), default_fn)
+        self.assertIs(svc._get_llm("consolidation"), default_fn)
+        self.assertIs(svc._get_llm("promotion"), default_fn)
 
-    def test_partial_override_extraction_only(self):
-        default_fn = MagicMock(name="default")
-        extract_fn = MagicMock(name="extract")
+    def test_all_six_operations_separate(self):
+        fns = {op: MagicMock(name=op) for op in MemoryService.LLM_OPERATIONS}
         svc = MemoryService(
             embedding_provider=_make_mock_emb(),
             settings=AppSettings(),
-            llm_fn=default_fn,
-            extraction_llm_fn=extract_fn,
+            llm_fns=fns,
         )
-        self.assertIs(svc._extraction_llm_fn, extract_fn)
-        self.assertIs(svc._answer_llm_fn, default_fn)
-
-    def test_partial_override_answer_only(self):
-        default_fn = MagicMock(name="default")
-        answer_fn = MagicMock(name="answer")
-        svc = MemoryService(
-            embedding_provider=_make_mock_emb(),
-            settings=AppSettings(),
-            llm_fn=default_fn,
-            answer_llm_fn=answer_fn,
-        )
-        self.assertIs(svc._extraction_llm_fn, default_fn)
-        self.assertIs(svc._answer_llm_fn, answer_fn)
+        for op in MemoryService.LLM_OPERATIONS:
+            self.assertIs(svc._get_llm(op), fns[op])
 
     def test_no_llm_fn_at_all(self):
         svc = MemoryService(
             embedding_provider=_make_mock_emb(),
             settings=AppSettings(),
         )
-        self.assertIsNone(svc._extraction_llm_fn)
-        self.assertIsNone(svc._answer_llm_fn)
+        for op in MemoryService.LLM_OPERATIONS:
+            self.assertIsNone(svc._get_llm(op))
+
+    def test_per_operation_without_default(self):
+        extract_fn = MagicMock(name="extract")
+        svc = MemoryService(
+            embedding_provider=_make_mock_emb(),
+            settings=AppSettings(),
+            llm_fns={"extraction": extract_fn},
+        )
+        self.assertIs(svc._get_llm("extraction"), extract_fn)
+        self.assertIsNone(svc._get_llm("answer"))
 
 
-class TestDualLLMTrackers(unittest.TestCase):
-    """Test that tracked LLM helpers use the correct model config."""
+class TestPerOperationTrackers(unittest.TestCase):
+    """Test that _tracked_llm uses the correct model config per operation."""
 
     def test_extraction_tracker_uses_extraction_model(self):
         settings = AppSettings(extraction_llm_model="gpt-4o", llm_model="gpt-4o-mini")
@@ -83,7 +85,7 @@ class TestDualLLMTrackers(unittest.TestCase):
             settings=settings,
             llm_fn=lambda p: "ok",
         )
-        tracker = svc._tracked_extraction_llm()
+        tracker = svc._tracked_llm("extraction")
         self.assertIsNotNone(tracker)
         self.assertEqual(tracker.model, "gpt-4o")
 
@@ -94,9 +96,19 @@ class TestDualLLMTrackers(unittest.TestCase):
             settings=settings,
             llm_fn=lambda p: "ok",
         )
-        tracker = svc._tracked_answer_llm()
+        tracker = svc._tracked_llm("answer")
         self.assertIsNotNone(tracker)
         self.assertEqual(tracker.model, "gpt-4o")
+
+    def test_conflict_tracker_uses_conflict_model(self):
+        settings = AppSettings(conflict_llm_model="claude-sonnet-4-20250514", llm_model="gpt-4o-mini")
+        svc = MemoryService(
+            embedding_provider=_make_mock_emb(),
+            settings=settings,
+            llm_fn=lambda p: "ok",
+        )
+        tracker = svc._tracked_llm("conflict")
+        self.assertEqual(tracker.model, "claude-sonnet-4-20250514")
 
     def test_tracker_falls_back_to_llm_model(self):
         settings = AppSettings(llm_model="gpt-4o-mini")
@@ -105,35 +117,42 @@ class TestDualLLMTrackers(unittest.TestCase):
             settings=settings,
             llm_fn=lambda p: "ok",
         )
-        ext_tracker = svc._tracked_extraction_llm()
-        ans_tracker = svc._tracked_answer_llm()
-        self.assertEqual(ext_tracker.model, "gpt-4o-mini")
-        self.assertEqual(ans_tracker.model, "gpt-4o-mini")
+        for op in MemoryService.LLM_OPERATIONS:
+            tracker = svc._tracked_llm(op)
+            self.assertEqual(tracker.model, "gpt-4o-mini", f"Failed for {op}")
 
     def test_no_llm_returns_none(self):
         svc = MemoryService(
             embedding_provider=_make_mock_emb(),
             settings=AppSettings(),
         )
-        self.assertIsNone(svc._tracked_extraction_llm())
-        self.assertIsNone(svc._tracked_answer_llm())
+        for op in MemoryService.LLM_OPERATIONS:
+            self.assertIsNone(svc._tracked_llm(op))
 
 
-class TestDualLLMConfig(unittest.TestCase):
-    """Test config settings for dual LLM models."""
+class TestPerOperationConfig(unittest.TestCase):
+    """Test config settings for per-operation LLM models."""
 
-    def test_default_models_empty(self):
+    def test_all_default_empty(self):
         settings = AppSettings()
-        self.assertEqual(settings.extraction_llm_model, "")
-        self.assertEqual(settings.answer_llm_model, "")
+        for op in MemoryService.LLM_OPERATIONS:
+            self.assertEqual(getattr(settings, f"{op}_llm_model"), "")
 
     def test_custom_models(self):
         settings = AppSettings(
             extraction_llm_model="gpt-4o-mini",
+            conflict_llm_model="gpt-4o",
+            rerank_llm_model="gpt-4o-mini",
             answer_llm_model="gpt-4o",
+            consolidation_llm_model="claude-sonnet-4-20250514",
+            promotion_llm_model="claude-sonnet-4-20250514",
         )
         self.assertEqual(settings.extraction_llm_model, "gpt-4o-mini")
+        self.assertEqual(settings.conflict_llm_model, "gpt-4o")
+        self.assertEqual(settings.rerank_llm_model, "gpt-4o-mini")
         self.assertEqual(settings.answer_llm_model, "gpt-4o")
+        self.assertEqual(settings.consolidation_llm_model, "claude-sonnet-4-20250514")
+        self.assertEqual(settings.promotion_llm_model, "claude-sonnet-4-20250514")
 
 
 if __name__ == "__main__":

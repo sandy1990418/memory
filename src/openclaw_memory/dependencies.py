@@ -36,19 +36,17 @@ def init_services(
     settings: AppSettings,
     llm_fn=None,
     *,
-    extraction_llm_fn=None,
-    answer_llm_fn=None,
+    llm_fns: dict | None = None,
 ) -> None:
     """Initialize singleton services. Called from app lifespan.
 
     Parameters
     ----------
     llm_fn : callable, optional
-        Default LLM function (used as fallback for both extraction and answer).
-    extraction_llm_fn : callable, optional
-        LLM for memory extraction and conflict resolution.
-    answer_llm_fn : callable, optional
-        LLM for answer generation and re-ranking.
+        Default LLM function (fallback for any operation without a specific LLM).
+    llm_fns : dict, optional
+        Per-operation LLM callables. Keys are operation names:
+        extraction, conflict, rerank, answer, consolidation, promotion.
     """
     global _embedding_provider, _memory_service, _llm_fn
     _llm_fn = llm_fn
@@ -60,8 +58,7 @@ def init_services(
         embedding_provider=_embedding_provider,
         settings=settings,
         llm_fn=llm_fn,
-        extraction_llm_fn=extraction_llm_fn,
-        answer_llm_fn=answer_llm_fn,
+        llm_fns=llm_fns,
     )
 
 
