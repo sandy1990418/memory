@@ -1316,6 +1316,7 @@ def run_longmemeval_qa(
     service_batch_system_prompt: str,
     reuse_service_ingest: bool,
     read_answer_only: bool,
+    qa_workers: int = 1,
 ) -> dict[str, Any]:
     if pipeline == "manager":
         raise ValueError(
@@ -1386,7 +1387,10 @@ def run_longmemeval_qa(
             service_resolver_mode=normalized_resolver_mode,
         )
 
-    for idx, inst in enumerate(instances):
+    def _run_single_qa_instance(
+        idx: int,
+        inst: dict[str, Any],
+    ) -> dict[str, Any]:
         inst_start = time.time()
         qid = inst.get("question_id", f"idx-{idx}")
         qtype = inst.get("question_type", "unknown")
@@ -1397,7 +1401,7 @@ def run_longmemeval_qa(
         workspace_path: Path | None = None
         db_path: Path | None = None
         if cache_dir is not None:
-            inst_root = cache_dir / provider_label / qid
+            inst_root = cache_dir / provider_label / str(qid)
             retrieval_cache_file = (
                 inst_root
                 / (
@@ -1575,7 +1579,6 @@ def run_longmemeval_qa(
                                 user_id=service_user_id,
                                 max_attempts=service_drain_queue_max_attempts,
                             )
-                            _accumulate_queue_stats(drain_total, drain_stats)
                     raw_results = service.search(
                         service_user_id, inst["question"], **service_search_kwargs
                     )
@@ -1643,46 +1646,99 @@ def run_longmemeval_qa(
             ev_unsupported = 1.0 - ev_supported
             abst_prec: float | None = _abstention_precision(pred) if abstention else None
 
-            per_instance.append(
-                {
-                    "question_id": qid,
-                    "question_type": qtype,
-                    "question": question,
-                    "answer": gold,
-                    "prediction": pred,
-                    "retrieval_hit@5": retrieval_hit,
-                    "retrieval_coverage@5": cov5["coverage"],
-                    "retrieval_all_hit@5": cov5["all_hit"],
-                    "retrieval_coverage@10": cov10["coverage"],
-                    "retrieval_all_hit@10": cov10["all_hit"],
-                    "exact_match": em,
-                    "f1": f1,
-                    "judge_correct": judged,
-                    "evidence_supported_rate": ev_supported,
-                    "unsupported_claim_rate": ev_unsupported,
-                    "abstention_precision": abst_prec,
-                    "answer_contract": {
-                        "abstain": payload.abstain,
-                        "confidence": payload.confidence,
-                        "evidence_count": len(payload.evidence),
-                        "abstain_reason": payload.abstain_reason,
-                    },
-                    "retrieval_cached": cached_retrieval,
-                    "service_ingested": should_ingest if pipeline == "service" else None,
-                    "queue_drain": drain_stats if pipeline == "service" else None,
-                }
+            inst_elapsed = time.time() - inst_start
+            print(
+                "    done in "
+                f"{inst_elapsed:.1f}s | EM={em:.3f} F1={f1:.3f} "
+                f"cov5={cov5['coverage']:.3f} all5={cov5['all_hit']:.0f}",
+                flush=True,
             )
+
+            return {
+                "question_id": qid,
+                "question_type": qtype,
+                "question": question,
+                "answer": gold,
+                "prediction": pred,
+                "retrieval_hit@5": retrieval_hit,
+                "retrieval_coverage@5": cov5["coverage"],
+                "retrieval_all_hit@5": cov5["all_hit"],
+                "retrieval_coverage@10": cov10["coverage"],
+                "retrieval_all_hit@10": cov10["all_hit"],
+                "exact_match": em,
+                "f1": f1,
+                "judge_correct": judged,
+                "evidence_supported_rate": ev_supported,
+                "unsupported_claim_rate": ev_unsupported,
+                "abstention_precision": abst_prec,
+                "answer_contract": {
+                    "abstain": payload.abstain,
+                    "confidence": payload.confidence,
+                    "evidence_count": len(payload.evidence),
+                    "abstain_reason": payload.abstain_reason,
+                },
+                "retrieval_cached": cached_retrieval,
+                "service_ingested": should_ingest if pipeline == "service" else None,
+                "queue_drain": drain_stats if pipeline == "service" else None,
+                "_drain_stats": drain_stats,
+            }
         finally:
             if tmpdir is not None:
                 shutil.rmtree(tmpdir, ignore_errors=True)
 
-        inst_elapsed = time.time() - inst_start
-        print(
-            "    done in "
-            f"{inst_elapsed:.1f}s | EM={em:.3f} F1={f1:.3f} "
-            f"cov5={cov5['coverage']:.3f} all5={cov5['all_hit']:.0f}",
-            flush=True,
-        )
+    # -- Run QA instances (parallel or sequential) --
+    if qa_workers > 1:
+        print(f"  QA workers={qa_workers} (parallel read/answer mode)", flush=True)
+        with ThreadPoolExecutor(max_workers=qa_workers) as executor:
+            future_to_idx = {
+                executor.submit(_run_single_qa_instance, idx, inst): idx
+                for idx, inst in enumerate(instances)
+            }
+            results_by_idx: dict[int, dict[str, Any]] = {}
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    inst = instances[idx]
+                    qid = inst.get("question_id", f"idx-{idx}")
+                    qtype = inst.get("question_type", "unknown")
+                    print(f"    [{idx+1}/{len(instances)}] {qid} FAILED: {exc}", flush=True)
+                    result = {
+                        "question_id": qid,
+                        "question_type": qtype,
+                        "question": inst.get("question", ""),
+                        "answer": str(inst.get("answer", "")),
+                        "prediction": "",
+                        "retrieval_hit@5": 0.0,
+                        "retrieval_coverage@5": 0.0,
+                        "retrieval_all_hit@5": 0.0,
+                        "retrieval_coverage@10": 0.0,
+                        "retrieval_all_hit@10": 0.0,
+                        "exact_match": 0.0,
+                        "f1": 0.0,
+                        "judge_correct": None,
+                        "evidence_supported_rate": 0.0,
+                        "unsupported_claim_rate": 1.0,
+                        "abstention_precision": None,
+                        "answer_contract": None,
+                        "retrieval_cached": False,
+                        "service_ingested": None,
+                        "queue_drain": None,
+                        "_drain_stats": None,
+                        "error": str(exc),
+                    }
+                results_by_idx[idx] = result
+            # Preserve original order
+            for idx in sorted(results_by_idx):
+                r = results_by_idx[idx]
+                _accumulate_queue_stats(drain_total, r.pop("_drain_stats", None))
+                per_instance.append(r)
+    else:
+        for idx, inst in enumerate(instances):
+            result = _run_single_qa_instance(idx, inst)
+            _accumulate_queue_stats(drain_total, result.pop("_drain_stats", None))
+            per_instance.append(result)
 
     if (
         pipeline == "service"
@@ -2026,6 +2082,15 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--qa-workers",
+        type=int,
+        default=1,
+        help=(
+            "Parallel workers for QA read/answer phase (default: 1). "
+            "Use 2-4 to parallelize retrieval+answer+judge across instances."
+        ),
+    )
+    parser.add_argument(
         "--distill-batch-sessions",
         type=int,
         default=2,
@@ -2130,6 +2195,8 @@ def main() -> None:
         raise SystemExit("--distill-batch-sessions must be >= 1")
     if args.service_workers < 1:
         raise SystemExit("--service-workers must be >= 1")
+    if args.qa_workers < 1:
+        raise SystemExit("--qa-workers must be >= 1")
     if args.service_drain_queue_limit < 1:
         raise SystemExit("--service-drain-queue-limit must be >= 1")
     if args.service_drain_queue_max_attempts < 1:
@@ -2322,6 +2389,7 @@ def main() -> None:
                 service_batch_system_prompt=args.service_batch_system_prompt,
                 reuse_service_ingest=args.reuse_service_ingest,
                 read_answer_only=args.read_answer_only,
+                qa_workers=args.qa_workers,
             )
         results.append(result)
 
@@ -2378,6 +2446,7 @@ def main() -> None:
             else None
         ),
         "service_workers": args.service_workers if args.pipeline == "service" else None,
+        "qa_workers": args.qa_workers,
         "reuse_service_ingest": args.reuse_service_ingest,
         "prepare_only": args.prepare_only,
         "read_answer_only": args.read_answer_only,

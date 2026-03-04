@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS episodic_memories (
     user_id     TEXT        NOT NULL,
     session_id  TEXT,
     content     TEXT        NOT NULL,
-    embedding   vector(1536),
+    embedding   vector({embedding_dims}),
     memory_type TEXT        NOT NULL,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     metadata    JSONB       NOT NULL DEFAULT '{}'
@@ -52,7 +52,7 @@ CREATE TABLE IF NOT EXISTS semantic_memories (
     id          UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id     TEXT        NOT NULL,
     content     TEXT        NOT NULL,
-    embedding   vector(1536),
+    embedding   vector({embedding_dims}),
     memory_type TEXT,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     metadata    JSONB       NOT NULL DEFAULT '{}'
@@ -84,7 +84,7 @@ CREATE TABLE IF NOT EXISTS canonical_memories (
     event_time            TIMESTAMPTZ,
     status                TEXT        NOT NULL DEFAULT 'active',
     supersedes_memory_id  UUID        REFERENCES canonical_memories(id),
-    embedding             vector(1536),
+    embedding             vector({embedding_dims}),
     created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
     metadata              JSONB       NOT NULL DEFAULT '{}'
@@ -203,12 +203,19 @@ def _load_migration(path: Path, fallback: str) -> str:
     return fallback
 
 
-def ensure_schema(conn: psycopg.Connection[Any]) -> None:
+def ensure_schema(
+    conn: psycopg.Connection[Any],
+    *,
+    embedding_dims: int = 1536,
+) -> None:
     """
     Idempotently apply all schema migrations.
 
     Safe to call on every application startup. Temporarily enables
     autocommit for CREATE EXTENSION support.
+
+    Args:
+        embedding_dims: Vector column dimension (from config.embedding_dimensions).
     """
     migrations = [
         (_MIGRATION_001, _INLINE_001),
@@ -221,6 +228,7 @@ def ensure_schema(conn: psycopg.Connection[Any]) -> None:
         with conn.cursor() as cur:
             for path, fallback in migrations:
                 sql = _load_migration(path, fallback)
+                sql = sql.replace("{embedding_dims}", str(embedding_dims))
                 cur.execute(sql)
     finally:
         conn.autocommit = prior_autocommit

@@ -15,6 +15,7 @@ from fastapi import FastAPI
 from .config import get_settings
 from .core.llm_client import create_llm_client
 from .db.connection import close_pool, init_pool
+from .core.embeddings import configure_pgvector_dims
 from .db.schema import ensure_schema
 from .dependencies import init_services
 
@@ -29,10 +30,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Initialize connection pool
     init_pool(settings.pg_dsn, min_size=settings.pg_pool_min, max_size=settings.pg_pool_max)
 
+    # Configure embedding dimensions from settings
+    configure_pgvector_dims(settings.embedding_dimensions)
+
     # Ensure database schema is up to date
     from .db.connection import get_pool
     with get_pool().connection() as conn:
-        ensure_schema(conn)
+        ensure_schema(conn, embedding_dims=settings.embedding_dimensions)
 
     # Create LLM client(s)
     # Default LLM (used as fallback for any operation without a specific model)

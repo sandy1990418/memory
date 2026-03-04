@@ -33,6 +33,12 @@ class AppSettings(BaseSettings):
         default="",
         description="Embedding model name (auto-resolved if empty)",
     )
+    embedding_dimensions: int = Field(
+        default=1536, ge=64, le=4096,
+        description="Embedding vector dimensions. Must match your model output "
+        "(e.g. 1536 for text-embedding-3-small, 768 for nomic-embed). "
+        "Changing this requires a schema migration.",
+    )
 
     # -- LLM --
     # Each operation can use a different LLM model. If a per-operation model
@@ -108,6 +114,24 @@ class AppSettings(BaseSettings):
 
     # -- Working memory --
     working_memory_max_messages: int = Field(default=20, ge=1)
+
+    # -- Memory lifecycle --
+    buffer_drain_every: int = Field(
+        default=8, ge=2,
+        description="Trigger mid-session extraction every N messages",
+    )
+    consolidation_trigger_threshold: int = Field(
+        default=20, ge=5,
+        description="Trigger consolidation after N new canonical memories since last run",
+    )
+    orphan_session_timeout_hours: float = Field(
+        default=2.0, gt=0,
+        description="Working messages older than N hours are considered orphaned",
+    )
+    superseded_cleanup_days: int = Field(
+        default=30, ge=7,
+        description="Physically delete superseded/deleted canonical memories after N days",
+    )
 
     # -- Auth --
     api_key_required: bool = Field(

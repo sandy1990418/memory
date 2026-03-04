@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from collections.abc import Callable
 from typing import Any
 
@@ -30,6 +31,8 @@ from ..memory.working import WorkingMemory
 from ..pipeline.ingest.conflict import apply_resolution, resolve_conflict
 from ..pipeline.ingest.extraction import extract_memories
 from ..pipeline.ingest.sensory import SensoryConfig, build_session_summary, prepare_for_extraction
+from ..consolidation.consolidator import MemoryConsolidator
+from ..consolidation.promotion import promote_events_to_semantic
 from ..pipeline.retrieval.answer import AnswerPayload, generate_answer
 from ..pipeline.retrieval.ranking import MMRConfig, TemporalDecayConfig
 from ..pipeline.retrieval.search import (
@@ -72,6 +75,10 @@ class MemoryService:
         self._default_llm_fn = llm_fn
         self._llm_fns: dict[str, Callable[[str], str]] = dict(llm_fns or {})
         self._working = WorkingMemory(max_messages=settings.working_memory_max_messages)
+        # Track how many messages have been drained per session (in-memory).
+        # Key: (user_id, session_id) -> number of messages already extracted.
+        # Lost on process restart — conflict resolution NOOP handles re-extraction.
+        self._drain_offsets: dict[tuple[str, str], int] = {}
 
     def _get_llm(self, operation: str) -> Callable[[str], str] | None:
         """Get the LLM callable for a specific operation, falling back to default."""
@@ -114,6 +121,15 @@ class MemoryService:
     ) -> None:
         """Initialize a session (clear stale working memory if any)."""
         self._working.clear_session(conn, user_id, session_id)
+        # Piggyback: clean up orphaned sessions for this user
+        timeout_hours = self._settings.orphan_session_timeout_hours
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM working_messages "
+                "WHERE user_id = %s AND session_id != %s "
+                "AND created_at < NOW() - make_interval(hours => %s)",
+                (user_id, session_id, timeout_hours),
+            )
 
     def record_message(
         self,
@@ -122,9 +138,24 @@ class MemoryService:
         session_id: str,
         role: str,
         content: str,
-    ) -> None:
-        """Append a message to L1 working memory."""
+    ) -> dict[str, Any] | None:
+        """
+        Append a message to L1 working memory.
+
+        Every ``buffer_drain_every`` messages, automatically triggers
+        mid-session extraction so memories are persisted incrementally
+        instead of only at session end.
+        """
         self._working.append(conn, user_id, session_id, role, content)
+
+        drain_every = self._settings.buffer_drain_every
+        if drain_every <= 0:
+            return None
+
+        msg_count = self._working.count(conn, user_id, session_id)
+        if msg_count > 0 and msg_count % drain_every == 0:
+            return self._drain_buffer(conn, user_id, session_id)
+        return None
 
     def end_session(
         self,
@@ -133,29 +164,42 @@ class MemoryService:
         session_id: str,
     ) -> dict[str, Any]:
         """
-        End a session: extract memories from working memory, store them,
-        save a session episode, and clear working memory.
+        End a session: extract remaining memories from working memory,
+        save a session episode, clear working memory, and trigger
+        background consolidation if needed.
 
-        Returns a summary dict with counts.
+        Only extracts messages that haven't been drained mid-session.
         """
-        # Get buffered messages
         messages = self._working.get_recent(conn, user_id, session_id)
+        key = (user_id, session_id)
+
         if not messages:
             self._working.clear_session(conn, user_id, session_id)
+            self._drain_offsets.pop(key, None)
             return {"extracted": 0, "stored": 0}
 
-        conversation = [{"role": m["role"], "content": m["content"]} for m in messages]
+        # Only extract messages not yet drained
+        last_offset = self._drain_offsets.get(key, 0)
+        remaining = messages[last_offset:]
 
-        # Extract and store memories
-        result = self._extract_and_store(conn, user_id, conversation, session_id=session_id)
+        result: dict[str, Any] = {"extracted": 0, "stored": 0}
+        if remaining:
+            conversation = [{"role": m["role"], "content": m["content"]} for m in remaining]
+            result = self._extract_and_store(conn, user_id, conversation, session_id=session_id)
 
-        # Save session summary as episodic memory
-        summary = build_session_summary(conversation, self.sensory_config)
+        # Save full session summary as episodic memory
+        all_conversation = [{"role": m["role"], "content": m["content"]} for m in messages]
+        summary = build_session_summary(all_conversation, self.sensory_config)
         if summary:
             store_session_episode(conn, user_id, session_id, summary, self._emb)
 
-        # Clear working memory
+        # Clear working memory and drain offset
         self._working.clear_session(conn, user_id, session_id)
+        self._drain_offsets.pop(key, None)
+
+        # Piggyback: consolidation check + lazy cleanup
+        self._maybe_consolidate(conn, user_id)
+        self._lazy_cleanup(conn, user_id)
 
         return result
 
@@ -426,6 +470,146 @@ class MemoryService:
 
         return {"extracted": len(memories), "stored": stored, "skipped": skipped}
 
+    def _drain_buffer(
+        self,
+        conn: psycopg.Connection[Any],
+        user_id: str,
+        session_id: str,
+    ) -> dict[str, Any] | None:
+        """
+        Mid-session extraction: extract memories from messages added since
+        the last drain.  Does NOT clear L1 (session is still active).
+        """
+        key = (user_id, session_id)
+        last_offset = self._drain_offsets.get(key, 0)
+
+        all_messages = self._working.get_recent(conn, user_id, session_id)
+        new_messages = all_messages[last_offset:]
+        if not new_messages:
+            return None
+
+        conversation = [{"role": m["role"], "content": m["content"]} for m in new_messages]
+        result = self._extract_and_store(conn, user_id, conversation, session_id=session_id)
+        self._drain_offsets[key] = len(all_messages)
+        return result
+
+    def _maybe_consolidate(
+        self,
+        conn: psycopg.Connection[Any],
+        user_id: str,
+    ) -> None:
+        """
+        Check if consolidation is needed and run it in a background thread.
+
+        Triggered when the number of new canonical memories since the last
+        consolidation exceeds ``consolidation_trigger_threshold``.
+        """
+        consolidation_llm = self._get_llm("consolidation")
+        if consolidation_llm is None:
+            return
+
+        threshold = self._settings.consolidation_trigger_threshold
+
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT MAX(finished_at) FROM consolidation_log "
+                "WHERE user_id = %s AND status = 'completed'",
+                (user_id,),
+            )
+            row = cur.fetchone()
+            last_finished = row[0] if row else None
+
+            if last_finished:
+                cur.execute(
+                    "SELECT COUNT(*) FROM canonical_memories "
+                    "WHERE user_id = %s AND status = 'active' AND created_at > %s",
+                    (user_id, last_finished),
+                )
+            else:
+                cur.execute(
+                    "SELECT COUNT(*) FROM canonical_memories "
+                    "WHERE user_id = %s AND status = 'active'",
+                    (user_id,),
+                )
+            new_count = cur.fetchone()[0]
+
+        if new_count < threshold:
+            return
+
+        # Capture values for background thread (avoid closing over mutable state)
+        dsn = self._settings.pg_dsn
+        emb = self._emb
+        sim_threshold = self._settings.consolidation_similarity_threshold
+        max_cluster = self._settings.consolidation_max_cluster_size
+        promotion_llm = self._get_llm("promotion") or consolidation_llm
+
+        def _run() -> None:
+            try:
+                with psycopg.connect(dsn) as bg_conn:
+                    # Advisory lock keyed on user_id hash to prevent concurrent
+                    # consolidation for the same user.
+                    lock_key = hash(user_id) % (2**31)
+                    with bg_conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT pg_try_advisory_lock(%s)", (lock_key,)
+                        )
+                        acquired = cur.fetchone()[0]
+                    if not acquired:
+                        logger.info("Consolidation already running for %s, skipping", user_id)
+                        return
+
+                    try:
+                        consolidator = MemoryConsolidator(
+                            emb, consolidation_llm,
+                            similarity_threshold=sim_threshold,
+                            max_cluster_size=max_cluster,
+                        )
+                        report = consolidator.consolidate(bg_conn, user_id)
+                        promote_events_to_semantic(bg_conn, user_id, emb, promotion_llm)
+                        bg_conn.commit()
+                        logger.info(
+                            "Consolidation for %s: scanned=%d merged=%d deleted=%d abstracted=%d",
+                            user_id, report.memories_scanned, report.memories_merged,
+                            report.memories_deleted, report.memories_abstracted,
+                        )
+                    finally:
+                        with bg_conn.cursor() as cur:
+                            cur.execute(
+                                "SELECT pg_advisory_unlock(%s)", (lock_key,)
+                            )
+            except Exception:
+                logger.exception("Background consolidation failed for %s", user_id)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _lazy_cleanup(
+        self,
+        conn: psycopg.Connection[Any],
+        user_id: str,
+    ) -> None:
+        """
+        Lightweight cleanup piggybacked on end_session.
+
+        1. Remove orphaned working messages (stale sessions).
+        2. Physically delete old superseded/deleted canonical memories.
+        """
+        timeout_hours = self._settings.orphan_session_timeout_hours
+        cleanup_days = self._settings.superseded_cleanup_days
+
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM working_messages "
+                "WHERE user_id = %s "
+                "AND created_at < NOW() - make_interval(hours => %s)",
+                (user_id, timeout_hours),
+            )
+            cur.execute(
+                "DELETE FROM canonical_memories "
+                "WHERE user_id = %s AND status IN ('superseded', 'deleted') "
+                "AND updated_at < NOW() - make_interval(days => %s)",
+                (user_id, cleanup_days),
+            )
+
     def _store_single(
         self,
         conn: psycopg.Connection[Any],
@@ -436,6 +620,10 @@ class MemoryService:
         llm_fn: TokenTracker | None = None,
     ) -> str:
         """Store a single memory with conflict resolution."""
+        # Use a savepoint so we can roll back to a clean state on failure
+        # without aborting the outer transaction.
+        with conn.cursor() as cur:
+            cur.execute("SAVEPOINT _store_single_sp")
         try:
             resolutions = resolve_conflict(
                 conn, user_id, memory, self._emb,
@@ -449,9 +637,13 @@ class MemoryService:
                 result_id = apply_resolution(conn, user_id, res, embedding=embedding)
                 if result_id:
                     memory_id = result_id
+            with conn.cursor() as cur:
+                cur.execute("RELEASE SAVEPOINT _store_single_sp")
             return memory_id
         except Exception:
             logger.warning("Conflict resolution failed, falling back to direct store")
+            with conn.cursor() as cur:
+                cur.execute("ROLLBACK TO SAVEPOINT _store_single_sp")
             tbl = table_for_memory(memory)
             if tbl == "episodic_memories":
                 return store_episodic(conn, user_id, memory, self._emb, session_id=session_id)

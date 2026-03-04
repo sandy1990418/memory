@@ -29,7 +29,13 @@ class EmbeddingProvider(Protocol):
 # Utilities
 # ---------------------------------------------------------------------------
 
-PGVECTOR_DIMS = 1536
+PGVECTOR_DIMS = 1536  # Default; overridden at startup via configure_pgvector_dims()
+
+
+def configure_pgvector_dims(dims: int) -> None:
+    """Set the global pgvector dimension from config (called at startup)."""
+    global PGVECTOR_DIMS
+    PGVECTOR_DIMS = dims
 
 
 def sanitize_and_normalize(vec: list[float]) -> list[float]:
@@ -42,14 +48,17 @@ def sanitize_and_normalize(vec: list[float]) -> list[float]:
 
 
 def coerce_pgvector_dims(
-    embedding: list[float], expected_dims: int = PGVECTOR_DIMS
+    embedding: list[float], expected_dims: int | None = None
 ) -> list[float]:
     """Pad or truncate embedding to match pgvector column dimensions."""
-    if len(embedding) == expected_dims:
+    target = expected_dims if expected_dims is not None else PGVECTOR_DIMS
+    if len(embedding) == target:
         return embedding
-    if len(embedding) > expected_dims:
-        return embedding[:expected_dims]
-    return embedding + ([0.0] * (expected_dims - len(embedding)))
+    if len(embedding) > target:
+        # Truncate and re-normalize (safe for MRL-capable models)
+        truncated = embedding[:target]
+        return sanitize_and_normalize(truncated)
+    return embedding + ([0.0] * (target - len(embedding)))
 
 
 def embedding_to_pg_literal(embedding: list[float]) -> str:

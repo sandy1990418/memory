@@ -32,6 +32,7 @@ PREP_MODEL="${LME_PREP_MODEL:-gpt-4o-mini}"
 QA_MODEL="${LME_QA_MODEL:-gpt-5-mini}"
 JUDGE="${LME_JUDGE:-longmemeval}"
 JUDGE_MODEL="${LME_JUDGE_MODEL:-gpt-4o-mini}"
+QA_WORKERS="${LME_QA_WORKERS:-1}"
 FAST_MODE="${LME_FAST_MODE:-0}"
 
 if [[ "${FAST_MODE}" == "1" ]]; then
@@ -68,6 +69,7 @@ Common env overrides:
   LME_SERVICE_WORKERS=${SERVICE_WORKERS}
   LME_AUTO_PREP_RETRY=${AUTO_PREP_RETRY}
   LME_OUTPUT=${OUTPUT}
+  LME_QA_WORKERS=${QA_WORKERS}
   LME_FAST_MODE=${FAST_MODE}
 EOF
 }
@@ -120,12 +122,13 @@ run_prepare() {
 
 run_read() {
   echo "== Phase: read-answer =="
-  echo "read config: model=${QA_MODEL} judge=${JUDGE}"
+  echo "read config: model=${QA_MODEL} judge=${JUDGE} qa_workers=${QA_WORKERS}"
   "${base_cmd[@]}" \
     --read-answer-only \
     --answer-model "${QA_MODEL}" \
     --judge "${JUDGE}" \
     --judge-model "${JUDGE_MODEL}" \
+    --qa-workers "${QA_WORKERS}" \
     "$@"
 }
 

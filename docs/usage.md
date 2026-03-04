@@ -9,15 +9,17 @@
 1. [系統總覽](#系統總覽)
 2. [目錄結構](#目錄結構)
 3. [架構圖](#架構圖)
-4. [三層記憶模型](#三層記憶模型)
-5. [兩條主要管線](#兩條主要管線)
-6. [模組詳解](#模組詳解)
-7. [資料庫 Schema](#資料庫-schema)
-8. [API 端點一覽](#api-端點一覽)
-9. [使用指南：如何跑起來](#使用指南如何跑起來)
-10. [使用指南：常見操作](#使用指南常見操作)
-11. [使用指南：LongMemEval Benchmark Service](#使用指南longmemeval-benchmark-service)
-12. [設定參數速查](#設定參數速查)
+4. [記憶生命週期引擎](#記憶生命週期引擎)
+5. [Token 監控與預算](#token-監控與預算)
+6. [三層記憶模型](#三層記憶模型)
+7. [兩條主要管線](#兩條主要管線)
+8. [模組詳解](#模組詳解)
+9. [資料庫 Schema](#資料庫-schema)
+10. [API 端點一覽](#api-端點一覽)
+11. [使用指南：如何跑起來](#使用指南如何跑起來)
+12. [使用指南：常見操作](#使用指南常見操作)
+13. [使用指南：LongMemEval Benchmark Service](#使用指南longmemeval-benchmark-service)
+14. [設定參數速查](#設定參數速查)
 
 ---
 
@@ -98,6 +100,107 @@ src/openclaw_memory/
 ---
 
 ## 架構圖
+
+### 資料流全景圖
+
+```
+═══════════════════════════════════════════════════════════════════════════════
+                            寫 入 路 徑（Ingest）
+═══════════════════════════════════════════════════════════════════════════════
+
+  session/start ──→ 初始化 L1 + 清理孤兒 session（> 2h 未活動）
+
+  session/message ──→ append to L1 (working_messages)
+                          │
+                          ├─ 每 8 則（buffer_drain_every）自動觸發 ↓
+                          │
+                     ┌────▼─────────────────────────────────────────┐
+                     │         Mid-Session Extraction               │
+                     │                                              │
+                     │  Sensory Filter ──→ LLM Extraction ──→ Conflict Resolution
+                     │  (過濾/壓縮/分段)    (萃取結構化記憶)    (比對 canonical)   │
+                     │                                         │              │
+                     │                           ┌─────────────┼──────┐       │
+                     │                           ▼             ▼      ▼       │
+                     │                    event → L2    fact/pref → L3  canonical
+                     │                    (episodic)    (semantic)   (ADD/UPDATE/
+                     │                                               SUPERSEDE/
+                     │                                               DELETE/NOOP)
+                     │                                                        │
+                     │  ※ 不清除 L1，session 繼續                             │
+                     └────────────────────────────────────────────────────────┘
+
+  session/end ──→ 取殘餘訊息（上次 drain 之後）──→ 同上 extraction 流程
+                     │
+                     ├─ 全 session 摘要 ──→ L2 episodic (session episode)
+                     │
+                     ├─ 清除 L1 + drain offset
+                     │
+                     ├─ Consolidation 檢查（新 canonical >= 20 筆？）
+                     │       │
+                     │       └─ YES → Background Thread（advisory lock）
+                     │                  ├─ Cluster（cosine >= 0.90）
+                     │                  ├─ LLM Merge → 標記舊為 superseded
+                     │                  ├─ Staleness Detection → delete/abstract
+                     │                  └─ Promotion（event > 90天 → fact）
+                     │
+                     └─ Lazy Cleanup
+                            ├─ 刪除孤兒 working messages
+                            └─ 物理刪除 superseded/deleted > 30天
+
+  memory/add ──→ 直接走 Extraction pipeline（或直接插入單筆記憶）
+
+═══════════════════════════════════════════════════════════════════════════════
+                            讀 取 路 徑（Retrieval）
+═══════════════════════════════════════════════════════════════════════════════
+
+  search ──→ query
+               │
+               ├──→ Vector Search (pgvector cosine) ──┐
+               │                                      ├──→ Hybrid Merge (0.7/0.3)
+               └──→ Keyword Search (tsvector BM25) ──┘          │
+                                                                ▼
+                                                    Temporal Decay (半衰期 30天)
+                                                                │
+                                                                ▼
+                                                       MMR 多樣性重排 (λ=0.7)
+                                                                │
+                                                                ▼
+                                                    LLM Rerank（可選）
+                                                                │
+                                                                ▼
+                                                          Top-K 結果
+
+  search/answer ──→ Top-K 結果 ──→ RAG Answer（附引用 + confidence）
+                        │
+                        └─ 預算檢查（FOR UPDATE 原子鎖）
+                              超額 → abstain: "Daily token budget exceeded"
+
+═══════════════════════════════════════════════════════════════════════════════
+                            儲 存 層
+═══════════════════════════════════════════════════════════════════════════════
+
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │                        PostgreSQL + pgvector                        │
+  │                                                                      │
+  │  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────────┐  │
+  │  │ working_messages │  │episodic_memories│  │ semantic_memories   │  │
+  │  │    （L1）        │  │    （L2）        │  │    （L3）           │  │
+  │  │ session 範圍     │  │ 時間衰減        │  │ 永久儲存           │  │
+  │  │ 最多 20 筆      │  │ HNSW + GIN      │  │ HNSW + GIN         │  │
+  │  └─────────────────┘  └─────────────────┘  └─────────────────────┘  │
+  │                                                                      │
+  │  ┌─────────────────────────────┐  ┌──────────────────────────────┐  │
+  │  │     canonical_memories      │  │       user_profiles          │  │
+  │  │ 合併後事實（unique key/user）│  │ token_budget_daily: 100000   │  │
+  │  │ status: active/superseded/  │  │ tokens_used_today（每日重置） │  │
+  │  │         deleted             │  │ budget_reset_at              │  │
+  │  │ HNSW index                  │  └──────────────────────────────┘  │
+  │  └─────────────────────────────┘                                    │
+  │                                                                      │
+  │  vector 維度由 embedding_dimensions 設定（預設 1536）                │
+  └──────────────────────────────────────────────────────────────────────┘
+```
 
 ### 整體系統架構
 
@@ -225,7 +328,7 @@ flowchart TB
     T2 -- "選擇需要完整內容的 ID" --> T3
 ```
 
-### Session 生命週期
+### Session 生命週期（含 Buffer Drain）
 
 ```mermaid
 sequenceDiagram
@@ -234,21 +337,36 @@ sequenceDiagram
     participant L1 as L1 Working
     participant L2 as L2 Episodic
     participant L3 as L3 Semantic
+    participant BG as Background Thread
 
     C->>S: POST /session/start {user_id, session_id}
-    S->>L1: 初始化 session，清除過期 L1
+    S->>L1: 初始化 session
+    S->>L1: 清理該 user 的孤兒 session（> 2h 未活動）
 
     loop 對話進行中
         C->>S: POST /session/message {role, content}
         S->>L1: append(role, content)
+        alt 每 8 則訊息（buffer_drain_every）
+            S->>S: Sensory → Extract → Conflict Resolve（僅新訊息）
+            S->>L2: store_episodic（事件類）
+            S->>L3: store_semantic（事實/偏好/決策）
+            Note right of S: 不清除 L1，session 繼續
+        end
     end
 
     C->>S: POST /session/end {user_id, session_id}
-    S->>L1: 讀取所有 L1 訊息
-    S->>S: Sensory → Extract → Conflict Resolve
-    S->>L2: store_episodic（事件類記憶）
-    S->>L3: store_semantic（事實/偏好/決策）
+    S->>L1: 讀取上次 drain 之後的殘餘訊息
+    S->>S: Sensory → Extract → Conflict Resolve（殘餘）
+    S->>L2: store_episodic + session summary
+    S->>L3: store_semantic
     S->>L1: clear_session
+
+    alt 累積 >= 20 筆新 canonical 記憶
+        S->>BG: 啟動 background consolidation
+        BG->>BG: cluster → merge → promote → dedup
+    end
+
+    S->>S: lazy cleanup（superseded 記憶物理刪除）
     S-->>C: {extracted: N, stored: M}
 ```
 
@@ -270,6 +388,191 @@ flowchart TB
     PROMO --> FIN["完成<br/>回報 ConsolidationReport"]
 ```
 
+### 記憶生命週期引擎
+
+系統採用**事件驅動**策略管理記憶的生命週期 — 所有觸發邏輯掛在已有的 request path 上，不需要外部排程器（Celery、cron 等）。
+
+#### 設計理念
+
+參考 LightMem 的 Atkinson-Shiffrin 認知模型，記憶的遷移和清理由三個自然觸發點驅動：
+
+```
+record_message ── 系統心跳 ──────────────────────────
+  ├─ append to L1
+  └─ 每 N 則 → buffer drain → extraction → L2/L3
+
+end_session ── 最終清理 ──────────────────────────────
+  ├─ extract 殘餘訊息（上次 drain 之後的）→ L2/L3
+  ├─ session summary → episodic
+  ├─ consolidation check → background thread
+  │   └─ cluster → merge → promote → dedup
+  └─ lazy cleanup → 物理刪除過期資料
+
+start_session ── 孤兒回收 ────────────────────────────
+  └─ 清理 > N 小時未活動的其他 session working messages
+```
+
+#### 觸發機制一覽
+
+| 觸發點 | 時機 | 動作 | 阻塞？ |
+|--------|------|------|--------|
+| **Buffer Drain** | `record_message` 每 `buffer_drain_every` 則（預設 8） | 對新訊息執行 sensory → extraction → conflict resolution → 寫入 L2/L3 | 是（同步） |
+| **殘餘 Extraction** | `end_session` | 對上次 drain 之後的殘餘訊息執行 extraction | 是（同步） |
+| **Consolidation** | `end_session`，當新 canonical 記憶 >= `consolidation_trigger_threshold`（預設 20） | cluster + merge + staleness detection + episodic→semantic promotion | 否（background thread） |
+| **Lazy Cleanup** | `end_session` | 物理刪除 superseded/deleted > N 天的 canonical 記憶 | 是（輕量 SQL） |
+| **孤兒回收** | `start_session` | 刪除該 user 超過 N 小時未活動的 working messages | 是（輕量 SQL） |
+
+#### Buffer Drain 詳解
+
+`record_message` 不再只是 append — 它是整個系統的心跳。
+
+```
+訊息 1  → append to L1
+訊息 2  → append to L1
+...
+訊息 8  → append to L1 + 觸發 drain
+            ↓
+         取出訊息 1~8
+         sensory filter → LLM extraction → conflict resolution
+         寫入 L2 (event) / L3 (fact/preference/decision)
+         記錄 drain offset = 8
+訊息 9  → append to L1
+...
+訊息 16 → append to L1 + 觸發 drain
+            ↓
+         取出訊息 9~16（只處理新的）
+         ...寫入 L2/L3
+         更新 drain offset = 16
+...
+session/end → 取出訊息 17~N（殘餘）→ extraction → 清除 L1
+```
+
+**重複 extraction 的處理**：drain offset 追蹤在記憶體中（process-level）。若 process restart 導致 offset 遺失，conflict resolution 的 NOOP action 會自動去重，不會造成重複記憶。
+
+#### Consolidation 觸發條件
+
+不使用定時排程。在 `end_session` 時 piggyback 檢查：
+
+1. 查詢 `consolidation_log` 取得上次成功 consolidation 的時間
+2. 計算之後新增的 active canonical 記憶數
+3. 若 >= `consolidation_trigger_threshold`（預設 20），啟動 background thread
+
+Background thread 使用**獨立的 DB connection**（不佔用 request connection），並透過 `pg_try_advisory_lock` 確保同一 user 不會同時執行多個 consolidation。執行：
+- `MemoryConsolidator.consolidate()` — 叢集合併 + 腐化檢測
+- `promote_events_to_semantic()` — 老舊 event（> 90 天）晉升為 semantic fact
+
+#### Lazy Cleanup 範圍
+
+| 清理目標 | 條件 | 上限 |
+|----------|------|------|
+| 孤兒 working messages | `created_at < NOW() - orphan_session_timeout_hours` | start_session 時清理 |
+| superseded canonical memories | `status IN ('superseded','deleted') AND updated_at < NOW() - superseded_cleanup_days` | end_session 時，每次最多清理一批 |
+
+#### 相關設定參數
+
+| 參數 | 環境變數 | 預設值 | 說明 |
+|------|---------|--------|------|
+| `buffer_drain_every` | `OPENCLAW_BUFFER_DRAIN_EVERY` | 8 | 每 N 則訊息觸發一次 mid-session extraction |
+| `consolidation_trigger_threshold` | `OPENCLAW_CONSOLIDATION_TRIGGER_THRESHOLD` | 20 | 累積 N 筆新 canonical 記憶後觸發 consolidation |
+| `orphan_session_timeout_hours` | `OPENCLAW_ORPHAN_SESSION_TIMEOUT_HOURS` | 2.0 | 超過 N 小時未活動的 session 視為孤兒 |
+| `superseded_cleanup_days` | `OPENCLAW_SUPERSEDED_CLEANUP_DAYS` | 30 | superseded/deleted 記憶保留天數 |
+
+---
+
+## Token 監控與預算
+
+系統內建三層 token 監控機制，從單次呼叫追蹤到每日預算控管。
+
+### 架構總覽
+
+```
+LLM 呼叫
+  │
+  ▼
+TokenTracker（utils/llm.py）── 呼叫層
+  ├─ 攔截每次 LLM 呼叫
+  ├─ 記錄 input/output tokens、耗時、operation
+  └─ 累計後交給 DB 層寫入
+          │
+          ▼
+user_profiles（db/queries.py）── 持久化層
+  ├─ tokens_used_today — 當日累計用量
+  ├─ token_budget_daily — 每日上限（預設 100,000）
+  ├─ budget_reset_at — 跨日自動重置
+  └─ SELECT ... FOR UPDATE — 原子檢查防併發超額
+          │
+          ▼
+Admin API（routers/admin.py）── 管理層
+  ├─ GET  /admin/usage/{user_id} — 查詢用量
+  └─ POST /admin/budget/{user_id} — 設定預算
+```
+
+### TokenTracker — 呼叫層追蹤
+
+`TokenTracker`（`utils/llm.py`）是一個透明包裝器，攔截 `Callable[[str], str]` 的 LLM 呼叫。
+
+```python
+class TokenTracker:
+    def __init__(self, llm_fn, *, model="gpt-4o-mini", operation="")
+    def __call__(self, prompt: str) -> str        # 透明代理，記錄 tokens
+    def with_operation(self, operation: str)       # 共用 call log 但標記不同 operation
+    def summary(self) -> dict                      # 按 operation 分組的用量摘要
+    def reset(self)                                # 清除記錄
+
+    # Properties
+    total_input_tokens: int
+    total_output_tokens: int
+    total_tokens: int
+    call_count: int
+```
+
+**哪些操作會被追蹤：**
+
+| Operation | 觸發位置 | 說明 |
+|-----------|---------|------|
+| `extraction` | `_extract_and_store` | LLM 記憶萃取 |
+| `conflict` | `_store_single` | 衝突解析（CRUD 判斷） |
+| `rerank` | `search` | LLM 重排序（可選） |
+| `answer` | `answer` | RAG 答案生成 |
+| `consolidation` | `_maybe_consolidate` | 背景合併（background thread） |
+| `promotion` | `_maybe_consolidate` | Episodic → Semantic 晉升 |
+
+每個 operation 可以配置獨立的 LLM model（透過 `OPENCLAW_{OP}_LLM_MODEL` 環境變數）。
+
+### 預算控管流程
+
+```mermaid
+flowchart LR
+    REQ["LLM 操作請求"] --> CHK{"_check_budget<br/>SELECT ... FOR UPDATE"}
+    CHK -- "remaining > 0" --> EXEC["執行 LLM 呼叫<br/>（TokenTracker 追蹤）"]
+    CHK -- "remaining <= 0" --> SKIP["跳過 LLM<br/>回傳 budget_exceeded"]
+    EXEC --> REC["_record_usage<br/>原子遞增 tokens_used_today"]
+    REC --> DONE["完成"]
+
+    style SKIP fill:#f66,color:#fff
+```
+
+**預算檢查點：**
+- `_extract_and_store` — extraction + conflict 之前檢查，超額時跳過整個 ingest pipeline
+- `answer` — RAG 生成之前檢查，超額時回傳 `abstain=True, abstain_reason="Daily token budget exceeded"`
+
+**每日自動重置**：`check_token_budget` 檢查 `budget_reset_at::date < now()::date`，跨日時自動歸零 `tokens_used_today`。
+
+**併發安全**：`check_token_budget` 使用 `SELECT ... FOR UPDATE` 鎖定 row，確保多個併發請求不會同時通過預算檢查後超額消耗。
+
+### Admin API
+
+```bash
+# 查詢用量
+curl http://localhost:8000/admin/usage/user_123
+# 回傳：{"user_id": "user_123", "budget": 100000, "used": 12345, "remaining": 87655, "reset_at": "...", "updated_at": "..."}
+
+# 設定每日預算
+curl -X POST http://localhost:8000/admin/budget/user_123 \
+  -H "Content-Type: application/json" \
+  -d '{"daily_limit": 200000}'
+```
+
 ---
 
 ## 三層記憶模型
@@ -279,6 +582,187 @@ flowchart TB
 | **L1** | Working Memory | `working_messages` | Session 範圍，最多 20 筆，用完即清 | 當前對話上下文 |
 | **L2** | Episodic Memory | `episodic_memories` | 時間衰減（半衰期 30 天），event 類型為主 | 近期事件記錄 |
 | **L3** | Semantic Memory | `semantic_memories` + `canonical_memories` | 永久儲存，不衰減 | 長期事實、偏好、決策 |
+
+### 每層存了什麼 & 搜尋能力
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ L1  working_messages                                                        │
+│                                                                              │
+│ 存了什麼：raw text（原始對話）                                               │
+│ ┌────────────────────────────────────────────────────────────┐               │
+│ │ id | user_id | session_id | role | content     | created_at│               │
+│ │ ...│ user_1  │ sess_abc   │ user │ "我喜歡拉麵" │ 09:15     │               │
+│ └────────────────────────────────────────────────────────────┘               │
+│                                                                              │
+│ ❌ 無 embedding       ❌ 無 tsvector         ❌ 不參與常規搜尋               │
+│ ✅ 可透過 search(include_working=True) 以 substring match 加入結果           │
+│ ✅ session/end 時被 extraction pipeline 消化後刪除                           │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ L2  episodic_memories                                                        │
+│                                                                              │
+│ 存了什麼：LLM 萃取後的結構化記憶 + embedding + 自動 tsvector                 │
+│ ┌──────────────────────────────────────────────────────────────────────┐     │
+│ │ id | user_id | content              | embedding    | memory_type     │     │
+│ │ ...│ user_1  │ "使用者喜歡吃拉麵"    │ [0.12, ...]  │ event           │     │
+│ │ ...│ user_1  │ "Session摘要: ..."    │ [0.08, ...]  │ session         │     │
+│ └──────────────────────────────────────────────────────────────────────┘     │
+│ + tsv tsvector GENERATED ALWAYS AS (to_tsvector('english', content))        │
+│                                                                              │
+│ ✅ embedding (vector cosine search)   ← HNSW 索引                           │
+│ ✅ tsvector (keyword BM25 search)     ← GIN 索引                            │
+│ ✅ 搜尋時被查詢（search_vector + search_keyword 都掃這張表）                 │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ L3  semantic_memories                                                        │
+│                                                                              │
+│ 存了什麼：LLM 萃取後的結構化記憶 + embedding + 自動 tsvector                 │
+│ ┌──────────────────────────────────────────────────────────────────────┐     │
+│ │ id | user_id | content               | embedding   | memory_type     │     │
+│ │ ...│ user_1  │ "使用者偏好拉麵"       │ [0.15, ...] │ preference      │     │
+│ │ ...│ user_1  │ "使用者住在台北"       │ [0.22, ...] │ fact            │     │
+│ └──────────────────────────────────────────────────────────────────────┘     │
+│ + tsv tsvector GENERATED ALWAYS AS (to_tsvector('english', content))        │
+│                                                                              │
+│ ✅ embedding (vector cosine search)   ← HNSW 索引                           │
+│ ✅ tsvector (keyword BM25 search)     ← GIN 索引                            │
+│ ✅ 搜尋時被查詢                                                              │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ L3  canonical_memories（conflict resolution 產物）                            │
+│                                                                              │
+│ 存了什麼：去重後的唯一事實 + embedding（無自動 tsvector，即時計算）            │
+│ ┌──────────────────────────────────────────────────────────────────────┐     │
+│ │ id | user_id | memory_key        | value         | embedding | status│     │
+│ │ ...│ user_1  │ "user_food_pref"  │ "喜歡拉麵"    │ [0.15,..] │ active│     │
+│ │ ...│ user_1  │ "user_location"   │ "住在台北"    │ [0.22,..] │ active│     │
+│ └──────────────────────────────────────────────────────────────────────┘     │
+│                                                                              │
+│ ✅ embedding (vector cosine search)   ← HNSW 索引                           │
+│ ✅ keyword search（即時 to_tsvector('english', value)，無預建 GIN 索引）      │
+│ ✅ 搜尋時被查詢                                                              │
+│ ⚠️  keyword search 較慢（每次現算 tsvector，不像 L2/L3 有 STORED column）     │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 搜尋涵蓋範圍一覽
+
+| 搜尋方式 | L1 working | L2 episodic | L3 semantic | canonical |
+|----------|:----------:|:-----------:|:-----------:|:---------:|
+| **Vector（cosine）** | ❌ | ✅ HNSW 索引 | ✅ HNSW 索引 | ✅ HNSW 索引 |
+| **Keyword（BM25）** | ❌ | ✅ GIN 索引（STORED tsv） | ✅ GIN 索引（STORED tsv） | ✅ 即時計算（無 GIN） |
+| **Hybrid merge** | ❌ | ✅ vec×0.7 + text×0.3 | ✅ vec×0.7 + text×0.3 | ✅ vec×0.7 + text×0.3 |
+| **Temporal decay** | — | ✅ 半衰期 30天 | ✅ 半衰期 30天 | ✅ 半衰期 30天 |
+| **include_working** | ✅ 直接回傳 raw | — | — | — |
+
+### Hybrid Search 在每層的運作流程
+
+一次搜尋實際上是**三張表各跑兩次查詢**，然後全部混在一起排序。
+
+```
+使用者查詢: "拉麵"
+       │
+       ├──→ embedding_provider.embed_query("拉麵") → query_vec [0.12, 0.08, ...]
+       │
+       │    ┌─────────────────────────────────────────────────────────────────┐
+       │    │  for tbl in [episodic, semantic, canonical]:                    │
+       │    │                                                                 │
+       │    │    ① search_vector(query_vec, table=tbl)                        │
+       │    │       SQL: SELECT ... 1.0 - (embedding <=> query_vec) AS sim    │
+       │    │            FROM {tbl} WHERE user_id = ? AND embedding IS NOT NULL│
+       │    │            ORDER BY embedding <=> query_vec LIMIT 20            │
+       │    │                                                                 │
+       │    │    ② search_keyword("拉麵", table=tbl)                          │
+       │    │       SQL: SELECT ... ts_rank(tsv_expr, plainto_tsquery(?))     │
+       │    │            FROM {tbl} WHERE user_id = ?                          │
+       │    │            AND tsv_expr @@ plainto_tsquery(?)                    │
+       │    │            ORDER BY rank DESC LIMIT 20                           │
+       │    └─────────────────────────────────────────────────────────────────┘
+       │
+       │    三張表 × 兩種搜尋 = 最多 6 次 SQL 查詢
+       │
+       ▼
+  merge_hybrid_results()
+       │
+       │  同一個 memory id 如果同時出現在 vector 和 keyword 結果：
+       │    score = 0.7 × vector_score + 0.3 × text_score
+       │
+       │  只出現在 vector：score = 0.7 × vector_score + 0
+       │  只出現在 keyword：score = 0 + 0.3 × text_score
+       │
+       ▼
+  apply_ranking_pipeline()
+       │
+       ├─ Temporal Decay: score × 2^(-age_days / 30)
+       ├─ MMR: 去除語義重複（λ=0.7 平衡 relevance vs diversity）
+       └─ LLM Rerank（可選）
+       │
+       ▼
+  Top-K 結果（混合了三張表的記憶，統一排序）
+```
+
+**各表 Keyword Search 的差異：**
+
+| 表格 | tsv 來源 | 索引 | 效能 |
+|------|---------|------|------|
+| `episodic_memories` | `tsv` STORED column（`to_tsvector('english', content)`，寫入時自動計算） | GIN 索引 | ✅ 快（索引查找） |
+| `semantic_memories` | `tsv` STORED column（同上） | GIN 索引 | ✅ 快（索引查找） |
+| `canonical_memories` | 即時計算 `to_tsvector('english', value)`（無預建欄位） | ❌ 無 GIN | ⚠️ 慢（全表掃描 + 即時計算） |
+
+> **為什麼 canonical 沒有 STORED tsvector？**
+> canonical_memories 的文字欄位叫 `value`（不是 `content`），且 `value` 會被 conflict resolution 頻繁 UPDATE。
+> STORED generated column 在每次 UPDATE 時都要重算，目前設計選擇用即時計算避免寫入開銷。
+> 如果 canonical 數量成長到查詢變慢，可以加上 `tsv` STORED column + GIN 索引。
+
+### 如何驗證每層有資料
+
+```bash
+# === L1: Working Memory（session 進行中才有） ===
+# 查看某 session 的 working messages
+psql -c "SELECT id, role, left(content, 50), created_at
+         FROM working_messages
+         WHERE user_id = 'USER' AND session_id = 'SESS'
+         ORDER BY created_at;"
+
+# === L2: Episodic Memory ===
+# 查看最近的 episodic 記憶，確認有 embedding
+psql -c "SELECT id, memory_type, left(content, 60),
+                CASE WHEN embedding IS NOT NULL THEN '✅' ELSE '❌' END AS has_emb,
+                created_at
+         FROM episodic_memories
+         WHERE user_id = 'USER'
+         ORDER BY created_at DESC LIMIT 10;"
+
+# === L3: Semantic Memory ===
+psql -c "SELECT id, memory_type, left(content, 60),
+                CASE WHEN embedding IS NOT NULL THEN '✅' ELSE '❌' END AS has_emb,
+                created_at
+         FROM semantic_memories
+         WHERE user_id = 'USER'
+         ORDER BY created_at DESC LIMIT 10;"
+
+# === Canonical Memory（L3 去重後） ===
+psql -c "SELECT id, memory_key, left(value, 60), status, confidence,
+                CASE WHEN embedding IS NOT NULL THEN '✅' ELSE '❌' END AS has_emb,
+                created_at
+         FROM canonical_memories
+         WHERE user_id = 'USER' AND status = 'active'
+         ORDER BY created_at DESC LIMIT 10;"
+
+# === 各層筆數統計 ===
+psql -c "SELECT
+           (SELECT COUNT(*) FROM working_messages WHERE user_id = 'USER') AS l1_working,
+           (SELECT COUNT(*) FROM episodic_memories WHERE user_id = 'USER') AS l2_episodic,
+           (SELECT COUNT(*) FROM semantic_memories WHERE user_id = 'USER') AS l3_semantic,
+           (SELECT COUNT(*) FROM canonical_memories WHERE user_id = 'USER' AND status = 'active') AS canonical_active;"
+
+# === 透過 API 查看 ===
+# 列出所有記憶（跨 L2/L3/canonical，不含 L1）
+curl "http://localhost:8000/memory/USER?limit=20"
+
+# Tier 1 搜尋（確認各層都有結果回來）
+curl -X POST http://localhost:8000/search \
+  -H "Content-Type: application/json" \
+  -d '{"user_id": "USER", "query": "拉麵", "limit": 20}'
+```
 
 ### 記憶類型（memory_type）
 
@@ -335,6 +819,7 @@ flowchart TB
    - RAG 答案生成
    - 結構化輸出：answer, confidence, evidence[], abstain
    - 自動重試（若 LLM 棄權但有 evidence）
+   - Token 預算以 `SELECT ... FOR UPDATE` 原子檢查，防止併發超額
 
 ---
 
@@ -349,9 +834,9 @@ class MemoryService:
     def __init__(self, embedding_provider, settings, llm_fn=None)
 
     # Session 生命週期
-    def start_session(self, conn, user_id, session_id)
-    def record_message(self, conn, user_id, session_id, role, content)
-    def end_session(self, conn, user_id, session_id) -> dict
+    def start_session(self, conn, user_id, session_id)        # + 孤兒 session 清理
+    def record_message(self, conn, user_id, session_id, role, content)  # + buffer drain
+    def end_session(self, conn, user_id, session_id) -> dict   # + consolidation + cleanup
 
     # 寫入
     def ingest_conversation(self, conn, user_id, conversation, *, session_id=None) -> dict
@@ -390,12 +875,14 @@ def create_embedding_provider(
 
 **支援的 Provider：**
 
-| Provider | 預設模型 | 環境變數 |
-|----------|---------|----------|
-| `openai` | text-embedding-3-small | `OPENAI_API_KEY` |
-| `gemini` | gemini-embedding-001 | `GEMINI_API_KEY` 或 `GOOGLE_API_KEY` |
-| `voyage` | voyage-4-large | `VOYAGE_API_KEY` |
-| `local` | llama-cpp GGUF | 需要 `llama-cpp-python` |
+| Provider | 預設模型 | 維度 | 環境變數 |
+|----------|---------|------|----------|
+| `openai` | text-embedding-3-small | 1536 | `OPENAI_API_KEY` |
+| `gemini` | gemini-embedding-001 | 768 | `GEMINI_API_KEY` 或 `GOOGLE_API_KEY` |
+| `voyage` | voyage-4-large | 1024 | `VOYAGE_API_KEY` |
+| `local` | llama-cpp GGUF | 依模型 | 需要 `llama-cpp-python` |
+
+**向量維度設定**：`embedding_dimensions` 必須匹配所選模型的輸出維度。若模型輸出維度不同，系統會自動截斷（適用於支援 Matryoshka/MRL 的模型如 OpenAI `text-embedding-3-*`）或零填充。變更維度需要重建 schema（DROP + CREATE 表格或新建資料庫）。
 
 ### `memory/working.py` — L1 Working Memory
 
@@ -403,6 +890,7 @@ def create_embedding_provider(
 class WorkingMemory:
     def __init__(max_messages=20)
     def append(conn, user_id, session_id, role, content)
+    def count(conn, user_id, session_id) -> int               # buffer drain 用
     def get_recent(conn, user_id, session_id, limit=None) -> list[dict]
     def clear_session(conn, user_id, session_id)
     def clear_user(conn, user_id)
@@ -439,7 +927,7 @@ erDiagram
         text user_id
         text session_id
         text content
-        vector_1536 embedding
+        vector embedding "維度由 embedding_dimensions 設定"
         text memory_type
         timestamptz created_at
         jsonb metadata
@@ -450,7 +938,7 @@ erDiagram
         uuid id PK
         text user_id
         text content
-        vector_1536 embedding
+        vector embedding "維度由 embedding_dimensions 設定"
         text memory_type
         timestamptz created_at
         jsonb metadata
@@ -467,7 +955,7 @@ erDiagram
         text event_time
         text status "active|superseded|deleted"
         uuid supersedes_memory_id FK
-        vector_1536 embedding
+        vector embedding "維度由 embedding_dimensions 設定"
         timestamptz created_at
         timestamptz updated_at
         jsonb metadata
@@ -502,6 +990,9 @@ erDiagram
     user_profiles {
         text user_id PK
         jsonb profile
+        int token_budget_daily "預設 100000"
+        int tokens_used_today "每日自動重置"
+        timestamptz budget_reset_at
         timestamptz updated_at
     }
 
@@ -569,6 +1060,13 @@ erDiagram
 | `POST` | `/search/detail` | `{memory_ids[]}` | `{results[{id, content, metadata}]}` | Tier 3 |
 | `POST` | `/search/answer` | `{user_id, query, top_k?, session_id?}` | `{answer, confidence, abstain, evidence[]}` | RAG |
 
+### Admin
+
+| Method | Path | Request | Response |
+|--------|------|---------|----------|
+| `GET` | `/admin/usage/{user_id}` | — | `{user_id, budget, used, remaining, reset_at, updated_at}` |
+| `POST` | `/admin/budget/{user_id}` | `{daily_limit}` | `{user_id, daily_limit}` |
+
 ---
 
 ## 使用指南：如何跑起來
@@ -592,6 +1090,7 @@ export OPENCLAW_LLM_MODEL="gpt-4o-mini"  # 預設值
 # 可選：Embedding 設定
 export OPENCLAW_EMBEDDING_PROVIDER="openai"  # auto|openai|gemini|voyage|local
 export OPENCLAW_EMBEDDING_MODEL="text-embedding-3-small"
+export OPENCLAW_EMBEDDING_DIMENSIONS=1536  # 需匹配模型輸出維度
 
 # 可選：伺服器設定
 export OPENCLAW_HOST="0.0.0.0"
@@ -624,9 +1123,10 @@ uvicorn openclaw_memory.app:create_app --factory --host 0.0.0.0 --port 8000
 ### 4. 啟動時自動做的事
 
 1. 建立 PostgreSQL 連線池
-2. 執行 Schema Migration（idempotent，安全重複執行）
-3. 建立 Embedding Provider
-4. 初始化 MemoryService 單例
+2. 設定 Embedding 向量維度（`embedding_dimensions`，寫入 schema DDL）
+3. 執行 Schema Migration（idempotent，安全重複執行）
+4. 建立 Embedding Provider
+5. 初始化 MemoryService 單例
 
 ---
 
@@ -825,6 +1325,7 @@ bash scripts/run_longmemeval_service.sh full --force-reindex --no-reuse-service-
 |------|---------|--------|------|
 | `embedding_provider` | `OPENCLAW_EMBEDDING_PROVIDER` | `"auto"` | 提供者選擇 |
 | `embedding_model` | `OPENCLAW_EMBEDDING_MODEL` | 依 provider | 模型名稱 |
+| `embedding_dimensions` | `OPENCLAW_EMBEDDING_DIMENSIONS` | 1536 | 向量維度（需匹配模型輸出，變更需 schema migration） |
 
 ### 搜尋
 
@@ -862,3 +1363,12 @@ bash scripts/run_longmemeval_service.sh full --force-reindex --no-reuse-service-
 | 參數 | 環境變數 | 預設值 | 說明 |
 |------|---------|--------|------|
 | `working_memory_max_messages` | `OPENCLAW_WORKING_MEMORY_MAX_MESSAGES` | 20 | L1 最大訊息數 |
+
+### 記憶生命週期
+
+| 參數 | 環境變數 | 預設值 | 說明 |
+|------|---------|--------|------|
+| `buffer_drain_every` | `OPENCLAW_BUFFER_DRAIN_EVERY` | 8 | 每 N 則訊息觸發一次 mid-session extraction |
+| `consolidation_trigger_threshold` | `OPENCLAW_CONSOLIDATION_TRIGGER_THRESHOLD` | 20 | 累積 N 筆新 canonical 記憶後觸發 consolidation |
+| `orphan_session_timeout_hours` | `OPENCLAW_ORPHAN_SESSION_TIMEOUT_HOURS` | 2.0 | 孤兒 session 超時（小時） |
+| `superseded_cleanup_days` | `OPENCLAW_SUPERSEDED_CLEANUP_DAYS` | 30 | superseded/deleted 記憶物理刪除天數 |

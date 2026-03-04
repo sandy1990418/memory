@@ -59,6 +59,11 @@ _SQL_DELETE_USER = """
     WHERE user_id = %s
 """
 
+_SQL_COUNT = """
+    SELECT COUNT(*) FROM working_messages
+    WHERE user_id = %s AND session_id = %s
+"""
+
 
 # ---------------------------------------------------------------------------
 # Working Memory Manager
@@ -119,6 +124,17 @@ class WorkingMemory:
         """Delete all working-memory messages for a specific session."""
         with conn.cursor() as cur:
             cur.execute(_SQL_DELETE_SESSION, (user_id, session_id))
+
+    def count(
+        self,
+        conn: psycopg.Connection[Any],
+        user_id: str,
+        session_id: str,
+    ) -> int:
+        """Return the number of messages for a session."""
+        with conn.cursor() as cur:
+            cur.execute(_SQL_COUNT, (user_id, session_id))
+            return cur.fetchone()[0]
 
     def clear_user(
         self,

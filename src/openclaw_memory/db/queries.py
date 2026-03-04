@@ -432,6 +432,8 @@ def check_token_budget(
 
     Auto-resets ``tokens_used_today`` when the calendar day changes.
     Creates a profile row if the user doesn't have one yet.
+    Uses SELECT ... FOR UPDATE to prevent race conditions with
+    concurrent record_token_usage calls.
     """
     with conn.cursor() as cur:
         cur.execute(
@@ -453,7 +455,8 @@ def check_token_budget(
             (user_id,),
         )
         cur.execute(
-            "SELECT token_budget_daily, tokens_used_today FROM user_profiles WHERE user_id = %s",
+            "SELECT token_budget_daily, tokens_used_today "
+            "FROM user_profiles WHERE user_id = %s FOR UPDATE",
             (user_id,),
         )
         row = cur.fetchone()
@@ -468,7 +471,7 @@ def record_token_usage(
     user_id: str,
     tokens: int,
 ) -> None:
-    """Increment tokens_used_today for a user."""
+    """Atomically increment tokens_used_today and return new remaining budget."""
     if tokens <= 0:
         return
     with conn.cursor() as cur:
