@@ -116,6 +116,7 @@ _ABSTAIN_PARSE_FAILURE = AnswerPayload(
     abstain=True,
     abstain_reason="Failed to parse answer",
 )
+_PARSE_FAILURE_REASON = _ABSTAIN_PARSE_FAILURE.abstain_reason
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +169,118 @@ def _format_evidence(evidence_chunks: list[dict[str, Any]]) -> str:
         score = chunk.get("score", 0.0)
         lines.append(f"[{i + 1}] id={mem_id!r}  score={score:.3f}\n{snippet}")
     return "\n\n".join(lines)
+
+
+def _is_parse_failure(payload: AnswerPayload) -> bool:
+    return payload.abstain and payload.abstain_reason == _PARSE_FAILURE_REASON
+
+
+def _build_parse_repair_prompt(
+    query: str,
+    evidence_chunks: list[dict[str, Any]],
+    previous_output: str,
+) -> str:
+    evidence_block = _format_evidence(evidence_chunks)
+    return f"""\
+You must repair a malformed answer into STRICT JSON with this schema only:
+{{
+  "answer": "<concise answer string>",
+  "evidence": [
+    {{
+      "memory_id": "<id from evidence>",
+      "quote": "<short verbatim span supporting the answer>",
+      "reason": "<one sentence explaining relevance>"
+    }}
+  ],
+  "confidence": <float 0.0-1.0>,
+  "abstain": <true|false>,
+  "abstain_reason": "<only required when abstain is true>"
+}}
+
+Rules:
+- Output ONLY valid JSON. No markdown, no prose.
+- Keep answer grounded in evidence.
+- If evidence includes a concrete answer, set "abstain": false.
+
+Question:
+{query}
+
+Evidence:
+{evidence_block}
+
+Previous malformed output:
+{previous_output}
+"""
+
+
+def _candidate_line_scores(query: str, text: str) -> list[tuple[int, str]]:
+    query_terms = {
+        tok
+        for tok in re.findall(r"[a-z0-9$]+", query.lower())
+        if len(tok) >= 3
+    }
+    out: list[tuple[int, str]] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        low = line.lower()
+        if low.startswith(("session:", "date:")):
+            continue
+        if low.startswith(("user:", "assistant:")) and ":" in line:
+            line = line.split(":", 1)[1].strip()
+            low = line.lower()
+            if not line:
+                continue
+        parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+", line) if p.strip()]
+        if not parts:
+            parts = [line]
+        for part in parts:
+            p_low = part.lower()
+            score = sum(1 for t in query_terms if t in p_low)
+            out.append((score, part))
+    return out
+
+
+def _best_effort_non_abstain(
+    query: str,
+    evidence_chunks: list[dict[str, Any]],
+) -> AnswerPayload:
+    best_score = -1
+    best_line = ""
+    best_mem_id = ""
+
+    for chunk in evidence_chunks[:3]:
+        mem_id = str(chunk.get("id") or chunk.get("path") or "chunk_0")
+        snippet = str(chunk.get("snippet", chunk.get("content", "")) or "")
+        for score, line in _candidate_line_scores(query, snippet):
+            if score > best_score or (score == best_score and best_line and len(line) < len(best_line)):
+                best_score = score
+                best_line = line
+                best_mem_id = mem_id
+
+    if not best_line:
+        top = evidence_chunks[0] if evidence_chunks else {}
+        best_mem_id = str(top.get("id") or top.get("path") or "chunk_0")
+        snippet = str(top.get("snippet", top.get("content", "")) or "").strip()
+        best_line = snippet.splitlines()[0].strip() if snippet else "Insufficient structured output."
+
+    if len(best_line) > 260:
+        best_line = best_line[:260].rstrip() + "..."
+
+    return AnswerPayload(
+        answer=best_line,
+        evidence=[
+            EvidenceItem(
+                memory_id=best_mem_id,
+                quote=best_line,
+                reason="Best-effort fallback after repeated parse failures.",
+            )
+        ],
+        confidence=0.2,
+        abstain=False,
+        abstain_reason="",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -283,12 +396,23 @@ def generate_answer(
         prompt = build_answer_prompt(query, evidence_chunks)
         response = llm_fn(prompt)
         payload = parse_answer_response(response)
+        if _is_parse_failure(payload):
+            repaired = llm_fn(_build_parse_repair_prompt(query, evidence_chunks, response))
+            payload = parse_answer_response(repaired)
 
         # Retry if abstained with evidence available
         if payload.abstain and evidence_chunks:
             retry_prompt = build_answer_prompt(query, evidence_chunks, retry=True)
             retry_response = llm_fn(retry_prompt)
-            return parse_answer_response(retry_response)
+            retry_payload = parse_answer_response(retry_response)
+            if _is_parse_failure(retry_payload):
+                repaired_retry = llm_fn(
+                    _build_parse_repair_prompt(query, evidence_chunks, retry_response)
+                )
+                retry_payload = parse_answer_response(repaired_retry)
+            if _is_parse_failure(retry_payload):
+                return _best_effort_non_abstain(query, evidence_chunks)
+            return retry_payload
 
         return payload
     except Exception:

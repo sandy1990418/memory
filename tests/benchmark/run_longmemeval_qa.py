@@ -176,11 +176,35 @@ def _supports_temperature(model: str) -> bool:
     return not model.startswith("gpt-5")
 
 
-def _openai_text(client: openai.OpenAI, model: str, system: str, user: str) -> str:
+def _openai_text(
+    client: openai.OpenAI,
+    model: str,
+    system: str,
+    user: str,
+    *,
+    force_json: bool = False,
+) -> str:
     messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": user},
     ]
+    if force_json:
+        # Prefer strict JSON mode for answer-contract tasks.
+        chat_kwargs = {
+            "model": model,
+            "messages": messages,
+            "response_format": {"type": "json_object"},
+        }
+        if _supports_temperature(model):
+            chat_kwargs["temperature"] = 0.0
+        try:
+            resp = client.chat.completions.create(**chat_kwargs)
+            text = (resp.choices[0].message.content or "").strip()
+            if text:
+                return text
+        except Exception:
+            pass
+
     try:
         kwargs = {"model": model, "input": messages}
         if _supports_temperature(model):
@@ -638,6 +662,83 @@ def _raw_embedding_text(
     return "\n...\n".join((head, middle, tail))
 
 
+def _split_text_with_overlap(
+    text: str,
+    *,
+    max_chars: int = 1600,
+    overlap_chars: int = 120,
+) -> list[str]:
+    text = (text or "").strip()
+    if not text:
+        return []
+    if len(text) <= max_chars:
+        return [text]
+    if max_chars <= 0:
+        return [text]
+
+    step = max(1, max_chars - max(0, overlap_chars))
+    parts: list[str] = []
+    start = 0
+    while start < len(text):
+        end = min(len(text), start + max_chars)
+        part = text[start:end].strip()
+        if part:
+            parts.append(part)
+        if end >= len(text):
+            break
+        start += step
+    return parts
+
+
+def _session_user_turn_chunks(
+    session: list[dict[str, Any]],
+    *,
+    session_id: str,
+    date: str,
+    max_chunk_chars: int = 1600,
+    overlap_chars: int = 120,
+) -> list[dict[str, Any]]:
+    """
+    Build raw-ingest chunks from user turns to reduce assistant-noise dominance.
+
+    Each chunk retains the original session/date metadata for evidence tracing.
+    """
+    chunks: list[dict[str, Any]] = []
+    for turn_idx, turn in enumerate(session):
+        role = str(turn.get("role", "user")).strip().lower() or "user"
+        content = str(turn.get("content", "")).strip()
+        if not content:
+            continue
+        if role != "user":
+            continue
+
+        parts = _split_text_with_overlap(
+            content,
+            max_chars=max_chunk_chars,
+            overlap_chars=overlap_chars,
+        )
+        for part_idx, part in enumerate(parts):
+            chunk_text = "\n".join(
+                [
+                    f"Session: {session_id}",
+                    f"Date: {date}",
+                    f"Turn: {turn_idx}",
+                    "Role: user",
+                    "",
+                    f"user: {part}",
+                ]
+            )
+            chunks.append(
+                {
+                    "content": chunk_text,
+                    "turn_index": turn_idx,
+                    "chunk_part": part_idx,
+                    "chunk_strategy": "raw_user_turn",
+                }
+            )
+    return chunks
+
+
 def _service_reset_user_data(pg_dsn: str, user_id: str) -> None:
     conn = get_pg_connection(pg_dsn)
     try:
@@ -856,14 +957,52 @@ def _service_ingest_raw_sessions(
     session_ids = instance.get("haystack_session_ids", [])
     dates = instance.get("haystack_dates", [])
 
-    content_rows: list[tuple[int, str, str, str, str]] = []
+    content_rows: list[dict[str, Any]] = []
     for i, (sess, sid, date) in enumerate(zip(sessions, session_ids, dates)):
-        content = _session_to_text(sess, str(sid), str(date))
-        emb_text = _raw_embedding_text(content)
-        content_rows.append((i, str(sid), str(date), content, emb_text))
+        sid_text = str(sid)
+        date_text = str(date)
+        turn_chunks = _session_user_turn_chunks(
+            sess,
+            session_id=sid_text,
+            date=date_text,
+        )
+        if turn_chunks:
+            for chunk in turn_chunks:
+                content = str(chunk["content"])
+                content_rows.append(
+                    {
+                        "session_index": i,
+                        "session_id": sid_text,
+                        "date": date_text,
+                        "content": content,
+                        "embedding_input": _raw_embedding_text(content),
+                        "turn_index": int(chunk.get("turn_index", -1)),
+                        "chunk_part": int(chunk.get("chunk_part", 0)),
+                        "chunk_strategy": str(chunk.get("chunk_strategy", "raw_user_turn")),
+                    }
+                )
+            continue
+
+        # Fallback for sessions without user content.
+        content = _session_to_text(sess, sid_text, date_text)
+        content_rows.append(
+            {
+                "session_index": i,
+                "session_id": sid_text,
+                "date": date_text,
+                "content": content,
+                "embedding_input": _raw_embedding_text(content),
+                "turn_index": -1,
+                "chunk_part": 0,
+                "chunk_strategy": "raw_session_fallback",
+            }
+        )
+
+    if not content_rows:
+        return
 
     # Batch embeddings to reduce API round-trips significantly.
-    embed_inputs = [row[4] for row in content_rows]
+    embed_inputs = [str(row["embedding_input"]) for row in content_rows]
     embeddings: list[list[float]]
     try:
         embeddings = provider.embed_batch(embed_inputs)
@@ -876,13 +1015,20 @@ def _service_ingest_raw_sessions(
     try:
         conn.autocommit = False
         with conn.cursor() as cur:
-            for (i, sid, date, content, _), embedding in zip(content_rows, embeddings):
+            for row, embedding in zip(content_rows, embeddings):
+                i = int(row["session_index"])
+                sid = str(row["session_id"])
+                date = str(row["date"])
+                content = str(row["content"])
                 embedding_str = "[" + ",".join(str(v) for v in embedding) + "]"
                 metadata = {
                     "source_path": f"memory/session_{i:04d}.md",
                     "session_id": str(sid),
                     "session_index": i,
                     "date": str(date),
+                    "turn_index": int(row.get("turn_index", -1)),
+                    "chunk_part": int(row.get("chunk_part", 0)),
+                    "chunk_strategy": str(row.get("chunk_strategy", "raw_user_turn")),
                 }
                 cur.execute(
                     """
@@ -907,14 +1053,137 @@ def _service_ingest_raw_sessions(
         conn.close()
 
 
+_EVIDENCE_STOPWORDS = frozenset({
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "whom",
+    "whose",
+    "how",
+    "why",
+    "did",
+    "does",
+    "do",
+    "is",
+    "are",
+    "was",
+    "were",
+    "the",
+    "a",
+    "an",
+    "to",
+    "of",
+    "in",
+    "on",
+    "for",
+    "with",
+    "and",
+    "or",
+    "my",
+    "your",
+    "our",
+    "i",
+    "me",
+    "you",
+    "it",
+    "that",
+    "this",
+    "there",
+})
+
+
+def _query_terms_for_evidence(query: str) -> list[str]:
+    terms = [t for t in re.findall(r"[a-z0-9$]+", query.lower()) if len(t) >= 3]
+    dedup: list[str] = []
+    seen: set[str] = set()
+    for t in terms:
+        if t in _EVIDENCE_STOPWORDS or t in seen:
+            continue
+        seen.add(t)
+        dedup.append(t)
+    return dedup
+
+
+def _clip_relevant_span(text: str, query: str, max_chars: int) -> str:
+    """
+    Query-aware evidence clipping.
+
+    For long raw-session chunks, the answer often appears late in the session.
+    Instead of always taking the head, anchor around lines that overlap with
+    question terms, then take a local window.
+    """
+    if len(text) <= max_chars:
+        return text
+
+    terms = _query_terms_for_evidence(query)
+    lines = text.splitlines(keepends=True)
+    if not lines:
+        return text[:max_chars].rstrip() + "..."
+
+    offsets: list[int] = []
+    pos = 0
+    for line in lines:
+        offsets.append(pos)
+        pos += len(line)
+
+    best_score = -1
+    best_anchor = -1
+    for line, off in zip(lines, offsets):
+        ll = line.lower()
+        if not ll.strip():
+            continue
+        score = 0
+        for t in terms:
+            if t in ll:
+                score += 1
+        if score > best_score:
+            best_score = score
+            best_anchor = off
+
+    if best_score >= 2:
+        start = max(0, best_anchor - (max_chars // 3))
+        start = min(start, max(0, len(text) - max_chars))
+        end = min(len(text), start + max_chars)
+        clipped = text[start:end]
+        if start > 0:
+            clipped = "...\n" + clipped
+        if end < len(text):
+            clipped = clipped.rstrip() + "\n..."
+        return clipped
+
+    # Weak/no query match: use head+middle+tail blend so late and mid-session
+    # facts still have a chance to appear in the evidence window.
+    head_budget = max(100, max_chars // 6)
+    mid_budget = max(180, max_chars // 3)
+    tail_budget = max(180, max_chars // 3)
+    # Keep room for separators.
+    if head_budget + mid_budget + tail_budget + 10 > max_chars:
+        overflow = head_budget + mid_budget + tail_budget + 10 - max_chars
+        tail_budget = max(140, tail_budget - overflow)
+        if head_budget + mid_budget + tail_budget + 10 > max_chars:
+            overflow = head_budget + mid_budget + tail_budget + 10 - max_chars
+            mid_budget = max(140, mid_budget - overflow)
+    sep = "\n...\n"
+    head = text[:head_budget].rstrip()
+    mid_start = max(0, (len(text) // 2) - (mid_budget // 2))
+    middle = text[mid_start: mid_start + mid_budget].strip()
+    tail = text[-tail_budget:].lstrip()
+    blended = head + sep + middle + sep + tail
+    if len(blended) > max_chars:
+        blended = blended[:max_chars].rstrip()
+    return blended
+
+
 def _result_to_evidence_chunks(
-    results: list[Any], max_results: int, max_chars: int
+    results: list[Any], max_results: int, max_chars: int, query: str = ""
 ) -> list[dict[str, Any]]:
     chunks: list[dict[str, Any]] = []
     for r in results[:max_results]:
         snippet = _result_snippet(r)
         if len(snippet) > max_chars:
-            snippet = snippet[:max_chars].rstrip() + "..."
+            snippet = _clip_relevant_span(snippet, query, max_chars)
         path = _result_path(r)
         chunks.append(
             {
@@ -1417,6 +1686,7 @@ def run_longmemeval_qa(
             answer_model,
             "You must return valid JSON only.",
             prompt,
+            force_json=True,
         )
 
     service: MemoryService | None = None
@@ -1691,7 +1961,12 @@ def run_longmemeval_qa(
                         answer_top_k=answer_k,
                         diversify_paths=diversify_paths,
                     )
-                    evidence_chunks = _result_to_evidence_chunks(results, answer_k, max_chars)
+                    evidence_chunks = _result_to_evidence_chunks(
+                        results,
+                        answer_k,
+                        max_chars,
+                        query=inst["question"],
+                    )
 
                 retrieval_hit = _retrieval_hit_at_k(
                     results,
@@ -2479,6 +2754,11 @@ def main() -> None:
         raise SystemExit("--service-drain-queue-max-attempts must be >= 1")
     if args.prepare_only and args.read_answer_only:
         raise SystemExit("--prepare-only and --read-answer-only are mutually exclusive")
+    if args.read_answer_only and args.force_reindex:
+        print(
+            "WARN: --force-reindex has no effect with --read-answer-only "
+            "(ingest is skipped). Run --prepare-only first to refresh data."
+        )
 
     default_service_distill = args.pipeline == "service" and args.service_write_mode == "distill"
     if args.search_k is None:

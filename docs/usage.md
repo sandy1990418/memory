@@ -1433,3 +1433,36 @@ bash scripts/run_longmemeval_service.sh full --force-reindex --no-reuse-service-
 | `consolidation_trigger_threshold` | `OPENCLAW_CONSOLIDATION_TRIGGER_THRESHOLD` | 20 | 累積 N 筆新 canonical 記憶後觸發 consolidation |
 | `orphan_session_timeout_hours` | `OPENCLAW_ORPHAN_SESSION_TIMEOUT_HOURS` | 2.0 | 孤兒 session 超時（小時） |
 | `superseded_cleanup_days` | `OPENCLAW_SUPERSEDED_CLEANUP_DAYS` | 30 | superseded/deleted 記憶物理刪除天數 |
+
+```python
+  python3 tests/benchmark/run_longmemeval_qa.py \
+    --pipeline service \
+    --provider openai \
+    --embedding-model text-embedding-3-small \
+    --service-write-mode raw \
+    --prepare-only \
+    --limit 8 \
+    --no-balanced \
+    --service-workers 4 \
+    --no-reuse-service-ingest \
+    --output tests/benchmark/results_longmemeval_qa_smoke_prepare.json
+
+  python3 tests/benchmark/run_longmemeval_qa.py \
+    --pipeline service \
+    --provider openai \
+    --embedding-model text-embedding-3-small \
+    --service-write-mode raw \
+    --read-answer-only \
+    --limit 8 \
+    --no-balanced \
+    --search-k 30 \
+    --answer-top-k 3 \
+    --max-chars 800 \
+    --no-diversify-paths \
+    --answer-model gpt-4o-mini \
+    --judge longmemeval \
+    --judge-model gpt-4o-mini \
+    --qa-workers 4 \
+    --output tests/benchmark/results_longmemeval_qa_smoke_read_judge.json
+
+```
