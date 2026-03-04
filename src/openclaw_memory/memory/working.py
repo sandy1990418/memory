@@ -151,20 +151,31 @@ class WorkingMemory:
         user_id: str,
         session_id: str,
     ) -> list[dict[str, Any]]:
-        """Convert working-memory messages to search result dicts."""
+        """Convert working-memory messages to search result dicts.
+
+        Scores decay linearly from 0.6 (most recent) to 0.3 (oldest),
+        so working memory participates in ranking without crowding out
+        high-relevance long-term memories.
+        """
         results: list[dict[str, Any]] = []
+        n = len(messages)
+        if n == 0:
+            return results
         for i, msg in enumerate(messages):
             content = msg.get("content", "")
             if not content:
                 continue
+            # i=0 is oldest, i=n-1 is most recent
+            recency = i / max(n - 1, 1)  # 0.0 .. 1.0
+            score = 0.3 + 0.3 * recency  # 0.3 .. 0.6
             results.append({
                 "id": f"wm:{user_id}:{session_id}:{i}",
                 "snippet": content,
                 "source": "working_memory",
                 "memory_type": "working",
-                "vector_score": 1.0,
-                "text_score": 1.0,
-                "score": 1.0,
+                "vector_score": score,
+                "text_score": score,
+                "score": score,
                 "created_at": msg.get("created_at"),
             })
         return results

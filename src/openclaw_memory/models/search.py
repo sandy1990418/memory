@@ -76,6 +76,11 @@ class AnswerRequest(BaseModel):
     query: str
     top_k: int | None = Field(default=6, ge=1, le=20)
     session_id: str | None = None
+    tables: list[str] | None = Field(
+        default=None,
+        description="Memory tables to search. Default: canonical + episodic (quota-based). "
+        "Options: 'canonical_memories', 'episodic_memories', 'semantic_memories'.",
+    )
 
 
 class AnswerEvidenceItem(BaseModel):

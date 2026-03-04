@@ -308,8 +308,14 @@ def _build_lme_evidence_files(instance: dict) -> list[dict[str, str]]:
     return evidence_files
 
 
-def _result_paths(item: Any) -> list[str]:
-    """Extract all source paths from a search result (handles batched source_paths)."""
+def _result_paths(item: Any, *, include_alias_paths: bool = True) -> list[str]:
+    """
+    Extract source paths from a search result.
+
+    When include_alias_paths=True, also includes batched `source_paths`
+    aliases stamped during benchmark ingest. Those aliases are useful for
+    recall diagnostics but can inflate hit@k versus actual top-path matches.
+    """
     paths: list[str] = []
     if hasattr(item, "path") and item.path:
         paths.append(str(item.path))
@@ -318,23 +324,25 @@ def _result_paths(item: Any) -> list[str]:
         sp = meta.get("source_path", "")
         if sp:
             paths.append(str(sp))
-        sps = meta.get("source_paths", [])
-        if isinstance(sps, list):
-            paths.extend(str(p) for p in sps if p)
+        if include_alias_paths:
+            sps = meta.get("source_paths", [])
+            if isinstance(sps, list):
+                paths.extend(str(p) for p in sps if p)
     if isinstance(item, dict):
         if item.get("path"):
             paths.append(str(item["path"]))
         if item.get("source_path"):
             paths.append(str(item["source_path"]))
-        sps = item.get("source_paths", [])
-        if isinstance(sps, list):
-            paths.extend(str(p) for p in sps if p)
+        if include_alias_paths:
+            sps = item.get("source_paths", [])
+            if isinstance(sps, list):
+                paths.extend(str(p) for p in sps if p)
     return paths
 
 
 def _result_path(item: Any) -> str:
     """Extract first path from search result (backwards-compat helper)."""
-    paths = _result_paths(item)
+    paths = _result_paths(item, include_alias_paths=False)
     return paths[0] if paths else ""
 
 
@@ -374,16 +382,37 @@ def _result_snippet(item: Any) -> str:
     return ""
 
 
-def _retrieval_hit_at_k(results: list[Any], evidence_files: list[dict], k: int = 5) -> float:
+def _retrieval_hit_at_k(
+    results: list[Any],
+    evidence_files: list[dict],
+    k: int = 5,
+    *,
+    include_alias_paths: bool = False,
+) -> float:
+    """
+    Hit@k by source path.
+
+    include_alias_paths=False (default) uses strict per-result paths only.
+    include_alias_paths=True also counts batched `source_paths` aliases.
+    """
     evidence_fns = {ef["filename"] for ef in evidence_files}
     all_paths: set[str] = set()
     for r in results[:k]:
-        all_paths.update(p.replace("\\", "/") for p in _result_paths(r))
+        all_paths.update(
+            p.replace("\\", "/")
+            for p in _result_paths(r, include_alias_paths=include_alias_paths)
+        )
     hit = any(any(p.endswith(ef) for p in all_paths) for ef in evidence_fns)
     return 1.0 if hit else 0.0
 
 
-def _evidence_coverage_at_k(results: list[Any], evidence_files: list[dict], k: int = 5) -> dict[str, float]:
+def _evidence_coverage_at_k(
+    results: list[Any],
+    evidence_files: list[dict],
+    k: int = 5,
+    *,
+    include_alias_paths: bool = False,
+) -> dict[str, float]:
     """
     Multi-evidence retrieval metrics.
 
@@ -398,7 +427,10 @@ def _evidence_coverage_at_k(results: list[Any], evidence_files: list[dict], k: i
 
     all_paths: set[str] = set()
     for r in results[:k]:
-        all_paths.update(p.replace("\\", "/") for p in _result_paths(r))
+        all_paths.update(
+            p.replace("\\", "/")
+            for p in _result_paths(r, include_alias_paths=include_alias_paths)
+        )
     matched: set[str] = set()
     for p in all_paths:
         for ef in evidence_fns:
@@ -464,11 +496,40 @@ def _select_instances(instances: list[dict], limit: int, balanced: bool) -> list
 
     by_type: dict[str, list[dict]] = {}
     for d in instances:
-        by_type.setdefault(d["question_type"], []).append(d)
-    per_type = max(1, limit // len(by_type))
+        qtype = str(d.get("question_type", "unknown"))
+        by_type.setdefault(qtype, []).append(d)
+
+    if not by_type:
+        return []
+
+    ordered_types = sorted(by_type)
+    quotas: dict[str, int] = {qt: 0 for qt in ordered_types}
+    base = limit // len(ordered_types)
+    remaining = limit
+
+    # First pass: equal base allocation per type (bounded by available count).
+    for qt in ordered_types:
+        take = min(base, len(by_type[qt]))
+        quotas[qt] = take
+        remaining -= take
+
+    # Second pass: round-robin fill to consume remainder and shortages.
+    while remaining > 0:
+        progressed = False
+        for qt in ordered_types:
+            if quotas[qt] >= len(by_type[qt]):
+                continue
+            quotas[qt] += 1
+            remaining -= 1
+            progressed = True
+            if remaining <= 0:
+                break
+        if not progressed:
+            break
+
     sampled: list[dict] = []
-    for qt in sorted(by_type):
-        sampled.extend(by_type[qt][:per_type])
+    for qt in ordered_types:
+        sampled.extend(by_type[qt][:quotas[qt]])
     return sampled[:limit]
 
 
@@ -512,6 +573,23 @@ def _build_evidence_chunks(
 def _serialize_results(results: list[Any]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for r in results:
+        source_path = ""
+        source_paths: list[str] = []
+        if hasattr(r, "metadata"):
+            meta = r.metadata if isinstance(r.metadata, dict) else {}
+            raw_sp = meta.get("source_path", "")
+            if raw_sp:
+                source_path = str(raw_sp)
+            raw_sps = meta.get("source_paths", [])
+            if isinstance(raw_sps, list):
+                source_paths = [str(p) for p in raw_sps if p]
+        if isinstance(r, dict):
+            if r.get("source_path"):
+                source_path = str(r["source_path"])
+            raw_sps = r.get("source_paths", source_paths)
+            if isinstance(raw_sps, list):
+                source_paths = [str(p) for p in raw_sps if p]
+
         out.append(
             {
                 "path": _result_path(r),
@@ -519,6 +597,8 @@ def _serialize_results(results: list[Any]) -> list[dict[str, Any]]:
                 "end_line": _result_end_line(r),
                 "score": _result_score(r),
                 "snippet": _result_snippet(r),
+                "source_path": source_path,
+                "source_paths": source_paths,
             }
         )
     return out
@@ -1434,8 +1514,11 @@ def run_longmemeval_qa(
             results: list[Any] = []
             service_user_id: str | None = None
             retrieval_hit = 0.0
+            retrieval_hit_with_aliases = 0.0
             cov5 = {"any_hit": 0.0, "coverage": 0.0, "all_hit": 0.0}
             cov10 = {"any_hit": 0.0, "coverage": 0.0, "all_hit": 0.0}
+            cov5_with_aliases = {"any_hit": 0.0, "coverage": 0.0, "all_hit": 0.0}
+            cov10_with_aliases = {"any_hit": 0.0, "coverage": 0.0, "all_hit": 0.0}
             should_ingest = False
             drain_stats: dict[str, int] | None = None
 
@@ -1451,23 +1534,43 @@ def run_longmemeval_qa(
                     if cached.get("question") == inst["question"]:
                         evidence_chunks = list(cached.get("evidence_chunks", []))
                         results = list(cached.get("results", []))
-                        retrieval_hit = float(
-                            cached.get(
-                                "retrieval_hit@5",
-                                _retrieval_hit_at_k(results, evidence_files, k=5),
-                            )
+                        # Recompute retrieval metrics from cached results to avoid
+                        # stale cache semantics across metric definition changes.
+                        retrieval_hit = _retrieval_hit_at_k(
+                            results,
+                            evidence_files,
+                            k=5,
+                            include_alias_paths=False,
                         )
-                        cov5 = dict(
-                            cached.get(
-                                "evidence_coverage@5",
-                                _evidence_coverage_at_k(results, evidence_files, k=5),
-                            )
+                        cov5 = _evidence_coverage_at_k(
+                            results,
+                            evidence_files,
+                            k=5,
+                            include_alias_paths=False,
                         )
-                        cov10 = dict(
-                            cached.get(
-                                "evidence_coverage@10",
-                                _evidence_coverage_at_k(results, evidence_files, k=10),
-                            )
+                        cov10 = _evidence_coverage_at_k(
+                            results,
+                            evidence_files,
+                            k=10,
+                            include_alias_paths=False,
+                        )
+                        retrieval_hit_with_aliases = _retrieval_hit_at_k(
+                            results,
+                            evidence_files,
+                            k=5,
+                            include_alias_paths=True,
+                        )
+                        cov5_with_aliases = _evidence_coverage_at_k(
+                            results,
+                            evidence_files,
+                            k=5,
+                            include_alias_paths=True,
+                        )
+                        cov10_with_aliases = _evidence_coverage_at_k(
+                            results,
+                            evidence_files,
+                            k=10,
+                            include_alias_paths=True,
                         )
                         cached_retrieval = True
                 except Exception:
@@ -1590,9 +1693,42 @@ def run_longmemeval_qa(
                     )
                     evidence_chunks = _result_to_evidence_chunks(results, answer_k, max_chars)
 
-                retrieval_hit = _retrieval_hit_at_k(results, evidence_files, k=5)
-                cov5 = _evidence_coverage_at_k(results, evidence_files, k=5)
-                cov10 = _evidence_coverage_at_k(results, evidence_files, k=10)
+                retrieval_hit = _retrieval_hit_at_k(
+                    results,
+                    evidence_files,
+                    k=5,
+                    include_alias_paths=False,
+                )
+                cov5 = _evidence_coverage_at_k(
+                    results,
+                    evidence_files,
+                    k=5,
+                    include_alias_paths=False,
+                )
+                cov10 = _evidence_coverage_at_k(
+                    results,
+                    evidence_files,
+                    k=10,
+                    include_alias_paths=False,
+                )
+                retrieval_hit_with_aliases = _retrieval_hit_at_k(
+                    results,
+                    evidence_files,
+                    k=5,
+                    include_alias_paths=True,
+                )
+                cov5_with_aliases = _evidence_coverage_at_k(
+                    results,
+                    evidence_files,
+                    k=5,
+                    include_alias_paths=True,
+                )
+                cov10_with_aliases = _evidence_coverage_at_k(
+                    results,
+                    evidence_files,
+                    k=10,
+                    include_alias_paths=True,
+                )
 
                 if retrieval_cache_file is not None:
                     try:
@@ -1606,6 +1742,9 @@ def run_longmemeval_qa(
                                     "retrieval_hit@5": retrieval_hit,
                                     "evidence_coverage@5": cov5,
                                     "evidence_coverage@10": cov10,
+                                    "retrieval_hit@5_with_aliases": retrieval_hit_with_aliases,
+                                    "evidence_coverage@5_with_aliases": cov5_with_aliases,
+                                    "evidence_coverage@10_with_aliases": cov10_with_aliases,
                                 },
                                 ensure_ascii=False,
                             ),
@@ -1650,6 +1789,7 @@ def run_longmemeval_qa(
             print(
                 "    done in "
                 f"{inst_elapsed:.1f}s | EM={em:.3f} F1={f1:.3f} "
+                f"hit5={retrieval_hit:.0f}/{retrieval_hit_with_aliases:.0f} "
                 f"cov5={cov5['coverage']:.3f} all5={cov5['all_hit']:.0f}",
                 flush=True,
             )
@@ -1661,10 +1801,15 @@ def run_longmemeval_qa(
                 "answer": gold,
                 "prediction": pred,
                 "retrieval_hit@5": retrieval_hit,
+                "retrieval_hit@5_with_aliases": retrieval_hit_with_aliases,
                 "retrieval_coverage@5": cov5["coverage"],
                 "retrieval_all_hit@5": cov5["all_hit"],
                 "retrieval_coverage@10": cov10["coverage"],
                 "retrieval_all_hit@10": cov10["all_hit"],
+                "retrieval_coverage@5_with_aliases": cov5_with_aliases["coverage"],
+                "retrieval_all_hit@5_with_aliases": cov5_with_aliases["all_hit"],
+                "retrieval_coverage@10_with_aliases": cov10_with_aliases["coverage"],
+                "retrieval_all_hit@10_with_aliases": cov10_with_aliases["all_hit"],
                 "exact_match": em,
                 "f1": f1,
                 "judge_correct": judged,
@@ -1711,10 +1856,15 @@ def run_longmemeval_qa(
                         "answer": str(inst.get("answer", "")),
                         "prediction": "",
                         "retrieval_hit@5": 0.0,
+                        "retrieval_hit@5_with_aliases": 0.0,
                         "retrieval_coverage@5": 0.0,
                         "retrieval_all_hit@5": 0.0,
                         "retrieval_coverage@10": 0.0,
                         "retrieval_all_hit@10": 0.0,
+                        "retrieval_coverage@5_with_aliases": 0.0,
+                        "retrieval_all_hit@5_with_aliases": 0.0,
+                        "retrieval_coverage@10_with_aliases": 0.0,
+                        "retrieval_all_hit@10_with_aliases": 0.0,
                         "exact_match": 0.0,
                         "f1": 0.0,
                         "judge_correct": None,
@@ -1765,6 +1915,16 @@ def run_longmemeval_qa(
     ]
     if retrieval_vals:
         agg["retrieval_hit@5"] = sum(retrieval_vals) / len(retrieval_vals)
+    retrieval_vals_alias = [
+        m["retrieval_hit@5_with_aliases"]
+        for m in per_instance
+        if m.get("retrieval_hit@5_with_aliases") is not None
+        and not str(m.get("question_id", "")).endswith("_abs")
+    ]
+    if retrieval_vals_alias:
+        agg["retrieval_hit@5_with_aliases"] = (
+            sum(retrieval_vals_alias) / len(retrieval_vals_alias)
+        )
     cov5_vals = [
         m["retrieval_coverage@5"]
         for m in per_instance
@@ -1773,6 +1933,16 @@ def run_longmemeval_qa(
     ]
     if cov5_vals:
         agg["retrieval_coverage@5"] = sum(cov5_vals) / len(cov5_vals)
+    cov5_vals_alias = [
+        m["retrieval_coverage@5_with_aliases"]
+        for m in per_instance
+        if m.get("retrieval_coverage@5_with_aliases") is not None
+        and not str(m.get("question_id", "")).endswith("_abs")
+    ]
+    if cov5_vals_alias:
+        agg["retrieval_coverage@5_with_aliases"] = (
+            sum(cov5_vals_alias) / len(cov5_vals_alias)
+        )
     all5_vals = [
         m["retrieval_all_hit@5"]
         for m in per_instance
@@ -1781,6 +1951,16 @@ def run_longmemeval_qa(
     ]
     if all5_vals:
         agg["retrieval_all_hit@5"] = sum(all5_vals) / len(all5_vals)
+    all5_vals_alias = [
+        m["retrieval_all_hit@5_with_aliases"]
+        for m in per_instance
+        if m.get("retrieval_all_hit@5_with_aliases") is not None
+        and not str(m.get("question_id", "")).endswith("_abs")
+    ]
+    if all5_vals_alias:
+        agg["retrieval_all_hit@5_with_aliases"] = (
+            sum(all5_vals_alias) / len(all5_vals_alias)
+        )
     cov10_vals = [
         m["retrieval_coverage@10"]
         for m in per_instance
@@ -1789,6 +1969,16 @@ def run_longmemeval_qa(
     ]
     if cov10_vals:
         agg["retrieval_coverage@10"] = sum(cov10_vals) / len(cov10_vals)
+    cov10_vals_alias = [
+        m["retrieval_coverage@10_with_aliases"]
+        for m in per_instance
+        if m.get("retrieval_coverage@10_with_aliases") is not None
+        and not str(m.get("question_id", "")).endswith("_abs")
+    ]
+    if cov10_vals_alias:
+        agg["retrieval_coverage@10_with_aliases"] = (
+            sum(cov10_vals_alias) / len(cov10_vals_alias)
+        )
     all10_vals = [
         m["retrieval_all_hit@10"]
         for m in per_instance
@@ -1797,6 +1987,16 @@ def run_longmemeval_qa(
     ]
     if all10_vals:
         agg["retrieval_all_hit@10"] = sum(all10_vals) / len(all10_vals)
+    all10_vals_alias = [
+        m["retrieval_all_hit@10_with_aliases"]
+        for m in per_instance
+        if m.get("retrieval_all_hit@10_with_aliases") is not None
+        and not str(m.get("question_id", "")).endswith("_abs")
+    ]
+    if all10_vals_alias:
+        agg["retrieval_all_hit@10_with_aliases"] = (
+            sum(all10_vals_alias) / len(all10_vals_alias)
+        )
     if judge == "openai":
         judged_vals = [m["judge_correct"] for m in per_instance if m["judge_correct"] is not None]
         agg["judge_acc"] = sum(1.0 if v else 0.0 for v in judged_vals) / len(judged_vals)
@@ -1832,10 +2032,15 @@ def run_longmemeval_qa(
                 "f1": [],
                 "count": 0,
                 "retrieval_hit@5": [],
+                "retrieval_hit@5_with_aliases": [],
                 "retrieval_coverage@5": [],
                 "retrieval_all_hit@5": [],
                 "retrieval_coverage@10": [],
                 "retrieval_all_hit@10": [],
+                "retrieval_coverage@5_with_aliases": [],
+                "retrieval_all_hit@5_with_aliases": [],
+                "retrieval_coverage@10_with_aliases": [],
+                "retrieval_all_hit@10_with_aliases": [],
                 "evidence_supported_rate": [],
                 "unsupported_claim_rate": [],
                 "abstention_precision": [],
@@ -1846,6 +2051,13 @@ def run_longmemeval_qa(
         by_type[qt]["f1"].append(m["f1"])
         if m.get("retrieval_hit@5") is not None and not str(m.get("question_id", "")).endswith("_abs"):
             by_type[qt]["retrieval_hit@5"].append(m["retrieval_hit@5"])
+        if (
+            m.get("retrieval_hit@5_with_aliases") is not None
+            and not str(m.get("question_id", "")).endswith("_abs")
+        ):
+            by_type[qt]["retrieval_hit@5_with_aliases"].append(
+                m["retrieval_hit@5_with_aliases"]
+            )
         if m.get("retrieval_coverage@5") is not None and not str(m.get("question_id", "")).endswith("_abs"):
             by_type[qt]["retrieval_coverage@5"].append(m["retrieval_coverage@5"])
         if m.get("retrieval_all_hit@5") is not None and not str(m.get("question_id", "")).endswith("_abs"):
@@ -1854,6 +2066,34 @@ def run_longmemeval_qa(
             by_type[qt]["retrieval_coverage@10"].append(m["retrieval_coverage@10"])
         if m.get("retrieval_all_hit@10") is not None and not str(m.get("question_id", "")).endswith("_abs"):
             by_type[qt]["retrieval_all_hit@10"].append(m["retrieval_all_hit@10"])
+        if (
+            m.get("retrieval_coverage@5_with_aliases") is not None
+            and not str(m.get("question_id", "")).endswith("_abs")
+        ):
+            by_type[qt]["retrieval_coverage@5_with_aliases"].append(
+                m["retrieval_coverage@5_with_aliases"]
+            )
+        if (
+            m.get("retrieval_all_hit@5_with_aliases") is not None
+            and not str(m.get("question_id", "")).endswith("_abs")
+        ):
+            by_type[qt]["retrieval_all_hit@5_with_aliases"].append(
+                m["retrieval_all_hit@5_with_aliases"]
+            )
+        if (
+            m.get("retrieval_coverage@10_with_aliases") is not None
+            and not str(m.get("question_id", "")).endswith("_abs")
+        ):
+            by_type[qt]["retrieval_coverage@10_with_aliases"].append(
+                m["retrieval_coverage@10_with_aliases"]
+            )
+        if (
+            m.get("retrieval_all_hit@10_with_aliases") is not None
+            and not str(m.get("question_id", "")).endswith("_abs")
+        ):
+            by_type[qt]["retrieval_all_hit@10_with_aliases"].append(
+                m["retrieval_all_hit@10_with_aliases"]
+            )
         by_type[qt]["count"] += 1
         if judge in ("openai", "longmemeval"):
             by_type[qt]["judge_correct"].append(1.0 if m["judge_correct"] else 0.0)
@@ -1875,21 +2115,46 @@ def run_longmemeval_qa(
             summary["retrieval_hit@5"] = (
                 sum(vals["retrieval_hit@5"]) / len(vals["retrieval_hit@5"])
             )
+        if vals.get("retrieval_hit@5_with_aliases"):
+            summary["retrieval_hit@5_with_aliases"] = (
+                sum(vals["retrieval_hit@5_with_aliases"])
+                / len(vals["retrieval_hit@5_with_aliases"])
+            )
         if vals.get("retrieval_coverage@5"):
             summary["retrieval_coverage@5"] = (
                 sum(vals["retrieval_coverage@5"]) / len(vals["retrieval_coverage@5"])
+            )
+        if vals.get("retrieval_coverage@5_with_aliases"):
+            summary["retrieval_coverage@5_with_aliases"] = (
+                sum(vals["retrieval_coverage@5_with_aliases"])
+                / len(vals["retrieval_coverage@5_with_aliases"])
             )
         if vals.get("retrieval_all_hit@5"):
             summary["retrieval_all_hit@5"] = (
                 sum(vals["retrieval_all_hit@5"]) / len(vals["retrieval_all_hit@5"])
             )
+        if vals.get("retrieval_all_hit@5_with_aliases"):
+            summary["retrieval_all_hit@5_with_aliases"] = (
+                sum(vals["retrieval_all_hit@5_with_aliases"])
+                / len(vals["retrieval_all_hit@5_with_aliases"])
+            )
         if vals.get("retrieval_coverage@10"):
             summary["retrieval_coverage@10"] = (
                 sum(vals["retrieval_coverage@10"]) / len(vals["retrieval_coverage@10"])
             )
+        if vals.get("retrieval_coverage@10_with_aliases"):
+            summary["retrieval_coverage@10_with_aliases"] = (
+                sum(vals["retrieval_coverage@10_with_aliases"])
+                / len(vals["retrieval_coverage@10_with_aliases"])
+            )
         if vals.get("retrieval_all_hit@10"):
             summary["retrieval_all_hit@10"] = (
                 sum(vals["retrieval_all_hit@10"]) / len(vals["retrieval_all_hit@10"])
+            )
+        if vals.get("retrieval_all_hit@10_with_aliases"):
+            summary["retrieval_all_hit@10_with_aliases"] = (
+                sum(vals["retrieval_all_hit@10_with_aliases"])
+                / len(vals["retrieval_all_hit@10_with_aliases"])
             )
         if judge in ("openai", "longmemeval"):
             summary["judge_acc"] = sum(vals["judge_correct"]) / len(vals["judge_correct"])
@@ -2118,8 +2383,19 @@ def main() -> None:
                         help="Search config (fts_only, vector_only, hybrid, hybrid_mmr, hybrid_decay)")
     parser.add_argument("--limit", type=int, default=48,
                         help="Max LongMemEval instances (default: 48)")
-    parser.add_argument("--balanced", action="store_true",
-                        help="Balance instances across question types")
+    parser.add_argument(
+        "--balanced",
+        dest="balanced",
+        action="store_true",
+        default=True,
+        help="Balance instances across question types (default: on)",
+    )
+    parser.add_argument(
+        "--no-balanced",
+        dest="balanced",
+        action="store_false",
+        help="Disable balanced sampling and keep dataset order",
+    )
     parser.add_argument("--max-results", type=int, default=5,
                         help="Top-K retrieved chunks to include in context")
     parser.add_argument("--search-k", type=int, default=None,

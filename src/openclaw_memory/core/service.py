@@ -253,11 +253,12 @@ class MemoryService:
         top_k: int | None = None,
         include_working: bool = False,
         session_id: str | None = None,
+        tables: list[str] | None = None,
     ) -> list[MemorySearchResult]:
         """
-        Full search across L2 + L3 with hybrid merge and ranking pipeline.
+        Quota-based layered search across L2 + L3 with hybrid merge and ranking.
 
-        Optionally prepends L1 working memory if include_working=True.
+        Optionally includes L1 working memory, merged by score.
         """
         max_results = top_k or self._settings.search_max_results
 
@@ -269,6 +270,8 @@ class MemoryService:
             mmr=self.mmr_config,
             llm_fn=self._get_llm("rerank"),
             top_k=max_results,
+            tables=tables,
+            canonical_ratio=self._settings.search_canonical_ratio,
         )
 
         if include_working and session_id:
@@ -285,7 +288,7 @@ class MemoryService:
                 )
                 for r in wm_results
             ]
-            results = wm_typed + results
+            results = sorted(results + wm_typed, key=lambda r: r.score, reverse=True)
 
         return results[:max_results]
 
@@ -335,6 +338,7 @@ class MemoryService:
         *,
         top_k: int = 6,
         session_id: str | None = None,
+        tables: list[str] | None = None,
     ) -> AnswerPayload:
         """Search + LLM answer generation with structured evidence."""
         if self._get_llm("answer") is None:
@@ -353,6 +357,7 @@ class MemoryService:
         results = self.search(
             conn, user_id, query,
             top_k=top_k, include_working=bool(session_id), session_id=session_id,
+            tables=tables,
         )
         if not results:
             return AnswerPayload(

@@ -113,6 +113,7 @@ def search_answer(
         conn, req.user_id, req.query,
         top_k=req.top_k or 6,
         session_id=req.session_id,
+        tables=req.tables,
     )
     return AnswerResponse(
         answer=payload.answer,

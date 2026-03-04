@@ -154,27 +154,68 @@ src/openclaw_memory/
                             讀 取 路 徑（Retrieval）
 ═══════════════════════════════════════════════════════════════════════════════
 
-  search ──→ query
-               │
-               ├──→ Vector Search (pgvector cosine) ──┐
-               │                                      ├──→ Hybrid Merge (0.7/0.3)
-               └──→ Keyword Search (tsvector BM25) ──┘          │
-                                                                ▼
-                                                    Temporal Decay (半衰期 30天)
-                                                                │
-                                                                ▼
-                                                       MMR 多樣性重排 (λ=0.7)
-                                                                │
-                                                                ▼
-                                                    LLM Rerank（可選）
-                                                                │
-                                                                ▼
-                                                          Top-K 結果
+  ★ search/answer（chatbot 主路徑）
+      │
+      ├─ 預算檢查（SELECT ... FOR UPDATE 原子鎖）
+      │     超額 → abstain: "Daily token budget exceeded"
+      │
+      └──→ service.search(include_working=有session_id時為True)
+              │
+              │  ┌─────────── ① pipeline_search() ─────────────────────┐
+              │  │                                                      │
+              │  │  for tbl in [episodic, semantic, canonical]:         │
+              │  │    ├─ search_vector(query_vec)  ← cosine, HNSW      │
+              │  │    └─ search_keyword(query)     ← BM25, GIN*        │
+              │  │                                                      │
+              │  │  → hybrid merge (0.7 × vector + 0.3 × text)        │
+              │  │  → temporal decay (半衰期 30天)                      │
+              │  │  → MMR 多樣性重排 (λ=0.7)                           │
+              │  │  → LLM Rerank（可選）                                │
+              │  │  → 排序後的 L2/L3 結果                               │
+              │  └──────────────────────────────────────────────────────┘
+              │
+              │  ┌─────────── ② L1 Working Memory ─────────────────────┐
+              │  │  （僅在有 session_id 時）                             │
+              │  │  get_recent() → 該 session 全部 raw messages        │
+              │  │  → 不做搜尋，全部塞入，score 固定 1.0（最高優先）   │
+              │  └──────────────────────────────────────────────────────┘
+              │
+              └──→ [L1 結果] + [L2/L3 結果] → 截斷到 top_k（預設 6）
+                          │
+                          ▼
+                  ┌─ generate_answer() ─────────────────────────────┐
+                  │                                                  │
+                  │  LLM 收到的 prompt:                              │
+                  │  ┌────────────────────────────────────────────┐  │
+                  │  │ ## User question                           │  │
+                  │  │ 使用者喜歡吃什麼？                         │  │
+                  │  │                                            │  │
+                  │  │ ## Evidence                                │  │
+                  │  │ [1] id='wm:...'  score=1.000  ← L1 raw    │  │
+                  │  │ 我今天中午吃了拉麵很好吃                   │  │
+                  │  │                                            │  │
+                  │  │ [2] id='uuid'  score=0.823  ← L2 episodic │  │
+                  │  │ 使用者 2024-12 提到喜歡吃拉麵              │  │
+                  │  │                                            │  │
+                  │  │ [3] id='uuid'  score=0.791  ← L3 canonical│  │
+                  │  │ 使用者偏好拉麵                              │  │
+                  │  │                                            │  │
+                  │  │ ... 截斷到 top_k 筆                        │  │
+                  │  └────────────────────────────────────────────┘  │
+                  │                                                  │
+                  │  ※ LLM 不知道哪筆來自哪層                       │
+                  │    只看到 numbered evidence + score              │
+                  │                                                  │
+                  │  → LLM 回傳 JSON:                                │
+                  │    {answer, evidence[{memory_id, quote, reason}], │
+                  │     confidence, abstain}                          │
+                  │                                                  │
+                  │  → 若 LLM abstain 但有 evidence → 自動 retry     │
+                  └──────────────────────────────────────────────────┘
 
-  search/answer ──→ Top-K 結果 ──→ RAG Answer（附引用 + confidence）
-                        │
-                        └─ 預算檢查（FOR UPDATE 原子鎖）
-                              超額 → abstain: "Daily token budget exceeded"
+          * canonical_memories 無 GIN 索引，keyword 即時計算 to_tsvector
+          ⚠ L1 的 score=1.0 且放最前面，若 L1 訊息多（>top_k），
+            L2/L3 長期記憶會被擠掉。僅在傳 session_id 時發生。
 
 ═══════════════════════════════════════════════════════════════════════════════
                             儲 存 層
@@ -310,22 +351,42 @@ flowchart LR
     TOP --> ANS["RAG Answer<br/>結構化答案<br/>附引用"]
 ```
 
-### 三層搜尋（Progressive Disclosure）
+### 搜尋端點使用場景
 
-```mermaid
-flowchart TB
-    subgraph "Tier 1 — Compact（~50 tokens/result）"
-        T1["POST /search<br/>回傳 id, title, type, score"]
-    end
-    subgraph "Tier 2 — Timeline（~200 tokens/result）"
-        T2["GET /search/timeline/{id}<br/>回傳 content + neighbors"]
-    end
-    subgraph "Tier 3 — Detail（完整內容）"
-        T3["POST /search/detail<br/>回傳 full content + metadata"]
-    end
+系統提供兩種搜尋路徑，服務不同場景：
 
-    T1 -- "選擇感興趣的 ID" --> T2
-    T2 -- "選擇需要完整內容的 ID" --> T3
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ ★ Chatbot 主路徑（核心場景）
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ POST /search/answer
+      │
+      └─→ service.answer()
+              │
+              └─→ service.search()  ← 完整 hybrid search
+                      │
+                      ├─ search_vector() × 3 表（cosine）
+                      ├─ search_keyword() × 3 表（BM25）
+                      ├─ hybrid merge（0.7/0.3）
+                      ├─ temporal decay + MMR
+                      └─ Top-K full content
+                              │
+                              └─→ generate_answer()  ← RAG，直接用完整內容
+
+ ※ 不經過分層搜尋，一步到位拿完整內容 → LLM 生成答案
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 預留端點（Admin Dashboard / MCP Agent / 外部整合用）
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ POST /search          → Tier 1: id + title + score（~50 tokens/筆）
+ GET  /search/timeline → Tier 2: content + 時序鄰居（~200 tokens/筆）
+ POST /search/detail   → Tier 3: full content + metadata
+
+ 這三個端點實作了 Progressive Disclosure 模式（類似 claude-mem），
+ 適合需要逐步探索的場景（如 AI agent 工具呼叫、admin 介面瀏覽）。
+ 目前 chatbot 主路徑不使用這些端點。
 ```
 
 ### Session 生命週期（含 Buffer Drain）
@@ -1053,12 +1114,12 @@ erDiagram
 
 ### Search
 
-| Method | Path | Request | Response | Tier |
+| Method | Path | Request | Response | 說明 |
 |--------|------|---------|----------|------|
-| `POST` | `/search` | `{user_id, query, limit?}` | `{results[{id, title, type, score}]}` | Tier 1 |
-| `GET` | `/search/timeline/{memory_id}?user_id=&depth_before=3&depth_after=3` | — | `{id, content, neighbors[]}` | Tier 2 |
-| `POST` | `/search/detail` | `{memory_ids[]}` | `{results[{id, content, metadata}]}` | Tier 3 |
-| `POST` | `/search/answer` | `{user_id, query, top_k?, session_id?}` | `{answer, confidence, abstain, evidence[]}` | RAG |
+| `POST` | `/search/answer` | `{user_id, query, top_k?, session_id?}` | `{answer, confidence, abstain, evidence[]}` | **★ Chatbot 主路徑** — hybrid search → RAG 一步到位 |
+| `POST` | `/search` | `{user_id, query, limit?}` | `{results[{id, title, type, score}]}` | 預留 Tier 1 — 輕量索引 |
+| `GET` | `/search/timeline/{memory_id}?user_id=&depth_before=3&depth_after=3` | — | `{id, content, neighbors[]}` | 預留 Tier 2 — 時序上下文 |
+| `POST` | `/search/detail` | `{memory_ids[]}` | `{results[{id, content, metadata}]}` | 預留 Tier 3 — 完整內容 |
 
 ### Admin
 

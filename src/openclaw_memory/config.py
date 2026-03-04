@@ -104,6 +104,11 @@ class AppSettings(BaseSettings):
     search_temporal_decay_half_life_days: float = Field(default=30.0, gt=0)
     search_mmr_enabled: bool = Field(default=True)
     search_mmr_lambda: float = Field(default=0.7, ge=0.0, le=1.0)
+    search_canonical_ratio: float = Field(
+        default=0.6, ge=0.0, le=1.0,
+        description="Fraction of top-K quota allocated to canonical_memories "
+        "(remaining goes to episodic). Only applies when multiple tables are searched.",
+    )
 
     # -- Consolidation --
     consolidation_similarity_threshold: float = Field(

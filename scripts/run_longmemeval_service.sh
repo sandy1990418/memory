@@ -98,7 +98,7 @@ base_cmd=(
 )
 
 if [[ "${BALANCED}" == "1" ]]; then
-  base_cmd+=(--balanced)
+  base_cmd+=(--no-balanced)
 fi
 if [[ "${LIGHTMEM}" == "1" ]]; then
   base_cmd+=(--service-lightmem)

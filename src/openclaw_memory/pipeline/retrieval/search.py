@@ -21,12 +21,17 @@ import psycopg
 from ...core.embeddings import EmbeddingProvider
 from ...core.types import MemoryContext, MemoryIndex, MemorySearchResult
 from ...db import queries
+from ...utils.similarity import jaccard_similarity, tokenize
 from .hybrid import merge_hybrid_results
 from .ranking import (
     MMRConfig,
     TemporalDecayConfig,
     apply_ranking_pipeline,
 )
+
+# Default table quotas: canonical gets the lion's share, episodic supplements.
+_DEFAULT_TABLES = ["canonical_memories", "episodic_memories"]
+_CANONICAL_RATIO = 0.6  # overridden by config via canonical_ratio param
 
 # ---------------------------------------------------------------------------
 # Query expansion (keyword extraction)
@@ -197,6 +202,24 @@ def search_detail(
 # ---------------------------------------------------------------------------
 
 
+def _dedup_by_content(
+    results: list[dict[str, Any]],
+    similarity_threshold: float = 0.85,
+) -> list[dict[str, Any]]:
+    """Remove near-duplicate results across tables, keeping first (higher-priority)."""
+    kept: list[dict[str, Any]] = []
+    for r in results:
+        r_tokens = tokenize(r.get("snippet", r.get("content", "")))
+        is_dup = any(
+            jaccard_similarity(r_tokens, tokenize(k.get("snippet", k.get("content", ""))))
+            >= similarity_threshold
+            for k in kept
+        )
+        if not is_dup:
+            kept.append(r)
+    return kept
+
+
 def search(
     conn: psycopg.Connection[Any],
     user_id: str,
@@ -210,12 +233,14 @@ def search(
     llm_fn: Callable[[str], str] | None = None,
     top_k: int = 10,
     tables: list[str] | None = None,
+    canonical_ratio: float = _CANONICAL_RATIO,
 ) -> list[MemorySearchResult]:
     """
-    Full search pipeline: vector + keyword -> hybrid merge -> ranking.
+    Quota-based layered search: each layer gets an independent quota.
 
-    Searches across L2 (episodic) and L3 (semantic/canonical) layers,
-    applies temporal decay, MMR, and optional LLM re-ranking.
+    Default searches canonical_memories (60% quota) + episodic_memories
+    (40% quota). Each layer runs its own hybrid merge + ranking pipeline,
+    then results are cross-layer deduped and merged.
 
     Args:
         conn:               PostgreSQL connection.
@@ -228,43 +253,53 @@ def search(
         mmr:                MMR config (None uses defaults).
         llm_fn:             Optional LLM callable for re-ranking.
         top_k:              Max results to return.
-        tables:             Tables to search (default: all).
+        tables:             Tables to search (default: canonical + episodic).
+        canonical_ratio:    Fraction of top_k allocated to canonical_memories.
 
     Returns:
         Ranked list of MemorySearchResult.
     """
-    target_tables = tables or ["episodic_memories", "semantic_memories", "canonical_memories"]
+    target_tables = tables or _DEFAULT_TABLES
     query_vec = embedding_provider.embed_query(query)
 
-    # Gather vector + keyword results from all target tables
-    all_vector: list[dict[str, Any]] = []
-    all_keyword: list[dict[str, Any]] = []
+    # Compute per-table quotas
+    n_tables = len(target_tables)
+    canonical_quota = max(1, int(top_k * canonical_ratio)) if n_tables > 1 else top_k
+    other_quota = max(1, top_k - canonical_quota) if n_tables > 1 else top_k
+
+    all_ranked: list[dict[str, Any]] = []
 
     for tbl in target_tables:
-        all_vector.extend(queries.search_vector(
-            conn, user_id, query_vec, limit=top_k * 2, table=tbl,
-        ))
-        all_keyword.extend(queries.search_keyword(
-            conn, user_id, query, limit=top_k * 2, table=tbl,
-        ))
+        quota = canonical_quota if tbl == "canonical_memories" else other_quota
+        fetch_limit = quota * 3  # over-fetch for ranking headroom
 
-    # Hybrid merge
-    merged = merge_hybrid_results(
-        vector=all_vector,
-        keyword=all_keyword,
-        vector_weight=vector_weight,
-        text_weight=text_weight,
-    )
+        vec_hits = queries.search_vector(
+            conn, user_id, query_vec, limit=fetch_limit, table=tbl,
+        )
+        kw_hits = queries.search_keyword(
+            conn, user_id, query, limit=fetch_limit, table=tbl,
+        )
 
-    # Apply ranking pipeline
-    ranked = apply_ranking_pipeline(
-        merged,
-        temporal_decay=temporal_decay,
-        mmr=mmr,
-        llm_fn=llm_fn,
-        query=query,
-        top_k=top_k,
-    )
+        merged = merge_hybrid_results(
+            vector=vec_hits,
+            keyword=kw_hits,
+            vector_weight=vector_weight,
+            text_weight=text_weight,
+        )
+
+        ranked = apply_ranking_pipeline(
+            merged,
+            temporal_decay=temporal_decay,
+            mmr=mmr,
+            llm_fn=llm_fn,
+            query=query,
+            top_k=quota,
+        )
+        all_ranked.extend(ranked)
+
+    # Cross-layer content dedup (canonical added first → kept on ties)
+    if len(target_tables) > 1:
+        all_ranked = _dedup_by_content(all_ranked)
 
     return [
         MemorySearchResult(
@@ -276,5 +311,5 @@ def search(
             source=r.get("source", ""),
             metadata=r.get("metadata", {}),
         )
-        for r in ranked
+        for r in all_ranked[:top_k]
     ]
